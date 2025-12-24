@@ -472,11 +472,25 @@ console.log(`Created ${splitResult.yesTokens} YES + ${splitResult.noTokens} NO`)
 
 #### Merge: YES + NO → USDC
 
+⚠️ **重要：两种 Merge 方法**
+
+| 方法 | 适用场景 | 推荐 |
+|------|----------|------|
+| `mergeByTokenIds()` | **Polymarket CLOB 市场** | ✅ 推荐 |
+| `merge()` | 标准 Gnosis CTF 市场 | ❌ Polymarket 慎用 |
+
 ```typescript
-// Merge 100 YES + 100 NO → 100 USDC (for arbitrage)
-const mergeResult = await ctf.merge(conditionId, '100');
+// ✅ 推荐：Polymarket 市场使用 mergeByTokenIds
+const tokenIds = {
+  yesTokenId: market.tokens[0].tokenId,  // 从 CLOB API 获取
+  noTokenId: market.tokens[1].tokenId,
+};
+const mergeResult = await ctf.mergeByTokenIds(conditionId, tokenIds, '100');
 console.log(`TX: ${mergeResult.txHash}`);
 console.log(`Received ${mergeResult.usdcReceived} USDC`);
+
+// ⚠️ 标准 CTF 方法（可能无法正确检查 Polymarket 余额）
+// const mergeResult = await ctf.merge(conditionId, '100');
 ```
 
 #### Redeem: Winning Tokens → USDC
