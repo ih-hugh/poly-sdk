@@ -722,7 +722,104 @@ Automated arbitrage monitoring using WebSocket for real-time orderbook updates, 
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Basic Usage
+#### 完整使用流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  ArbitrageService 使用指南                                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Step 1: 准备资金                                                            │
+│  ─────────────────                                                          │
+│  • 确保钱包有 USDC.e (不是 native USDC!)                                      │
+│  • 使用 SwapService 将 USDC → USDC.e (如需要)                                 │
+│  • 使用 AuthorizationService 授权 CTF 合约                                    │
+│                                                                             │
+│  Step 2: 选择市场                                                            │
+│  ─────────────────                                                          │
+│  • 使用 GammaAPI 搜索高流动性市场                                              │
+│  • 获取 conditionId, yesTokenId, noTokenId                                  │
+│  • 检查市场是否 active 且 acceptingOrders                                     │
+│                                                                             │
+│  Step 3: 初始化服务                                                          │
+│  ─────────────────                                                          │
+│  • 配置 ArbitrageService (profit threshold, trade size, rebalancer)         │
+│  • 设置事件监听器 (opportunity, execution, rebalance)                         │
+│  • 调用 start(market) 开始监控                                               │
+│                                                                             │
+│  Step 4: 运行期间                                                            │
+│  ─────────────────                                                          │
+│  • 自动检测套利机会 (WebSocket 实时推送)                                        │
+│  • autoExecute=true 时自动执行                                               │
+│  • Rebalancer 自动维持仓位平衡                                                │
+│                                                                             │
+│  Step 5: 市场结束                                                            │
+│  ─────────────────                                                          │
+│  • 调用 stop() 停止监控                                                      │
+│  • 调用 settlePosition() 合并配对代币 → 回收 USDC                              │
+│  • 未配对代币等市场结算后使用 CTFClient.redeemByTokenIds()                       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Step 1: 准备资金
+
+```typescript
+import {
+  SwapService,
+  AuthorizationService,
+  CTFClient
+} from '@catalyst-team/poly-sdk';
+
+// 1. 检查/转换 USDC.e
+const swapService = new SwapService(signer);
+const balances = await swapService.getBalances();
+console.log(`USDC.e: ${balances.find(b => b.symbol === 'USDC_E')?.balance}`);
+
+// 如果需要，将 native USDC 转为 USDC.e
+if (needSwap) {
+  await swapService.swap('USDC', 'USDC_E', '100');
+}
+
+// 2. 授权 CTF 合约
+const authService = new AuthorizationService(signer);
+const status = await authService.checkAllowances();
+if (!status.tradingReady) {
+  await authService.approveAll();
+}
+```
+
+#### Step 2: 选择市场
+
+```typescript
+import { GammaApiClient, ClobApiClient, RateLimiter } from '@catalyst-team/poly-sdk';
+
+const rateLimiter = new RateLimiter();
+const gammaApi = new GammaApiClient(rateLimiter);
+const clobApi = new ClobApiClient(rateLimiter);
+
+// 搜索高流动性市场
+const markets = await gammaApi.searchMarkets({
+  query: 'esports',
+  active: true,
+  closed: false,
+});
+
+// 选择一个市场
+const gammaMarket = markets[0];
+const clobMarket = await clobApi.getMarket(gammaMarket.conditionId);
+
+// 构建 market config
+const market = {
+  name: gammaMarket.question,
+  conditionId: gammaMarket.conditionId,
+  yesTokenId: clobMarket.tokens[0].tokenId,
+  noTokenId: clobMarket.tokens[1].tokenId,
+  outcomes: [clobMarket.tokens[0].outcome, clobMarket.tokens[1].outcome] as [string, string],
+};
+```
+
+#### Step 3-4: 初始化并运行
 
 ```typescript
 import { ArbitrageService } from '@catalyst-team/poly-sdk';
@@ -742,15 +839,6 @@ const arbService = new ArbitrageService({
   imbalanceThreshold: 5,   // Max YES-NO difference before fix
 });
 
-// Define market to monitor
-const market = {
-  name: 'Will BTC reach $100k?',
-  conditionId: '0x...',
-  yesTokenId: '12345...',  // From CLOB API
-  noTokenId: '67890...',
-  outcomes: ['Yes', 'No'] as [string, string],
-};
-
 // Listen for events
 arbService.on('opportunity', (opp) => {
   console.log(`${opp.type.toUpperCase()} ARB: ${opp.profitPercent.toFixed(2)}%`);
@@ -768,23 +856,14 @@ arbService.on('rebalance', (result) => {
 
 // Start monitoring
 await arbService.start(market);
+
+// Keep running...
+// When done:
+await arbService.stop();
+console.log(arbService.getStats());
 ```
 
-#### Manual Rebalancing
-
-```typescript
-// Check current rebalance recommendation
-const action = arbService.calculateRebalanceAction();
-console.log(`Recommended: ${action.type} ${action.amount} (${action.reason})`);
-
-// Execute rebalance manually
-if (action.type !== 'none') {
-  const result = await arbService.rebalance(action);
-  console.log(`Rebalance: ${result.success ? '✅' : '❌'} ${result.action.type}`);
-}
-```
-
-#### Settle Positions (Recover USDC)
+#### Step 5: 市场结束后清算
 
 ```typescript
 // View position without executing
@@ -797,27 +876,76 @@ console.log(`Unpaired NO: ${info.unpairedNo}`);
 const result = await arbService.settlePosition(market, true);
 if (result.merged) {
   console.log(`Recovered: $${result.usdcRecovered} USDC`);
-  console.log(`TX: ${result.mergeTxHash}`);
 }
 
-// Settle multiple markets at once
-const markets = [market1, market2, market3];
-const results = await arbService.settleMultiple(markets, true);
-const totalRecovered = results.reduce((sum, r) => sum + (r.usdcRecovered || 0), 0);
+// For unpaired tokens, wait for market resolution then redeem
+// 使用 CTFClient.redeemByTokenIds() 在市场结算后兑换获胜代币
+```
+
+#### 手动模式 (Manual Execution)
+
+```typescript
+// Initialize without autoExecute
+const arbService = new ArbitrageService({
+  privateKey: process.env.POLY_PRIVKEY,
+  autoExecute: false,  // Manual mode
+  enableRebalancer: false,  // Manual rebalancing
+});
+
+await arbService.start(market);
+
+// Check for opportunity manually
+const opportunity = arbService.checkOpportunity();
+if (opportunity && opportunity.profitPercent > 1.0) {
+  // Execute with custom logic
+  const result = await arbService.execute(opportunity);
+  console.log(`Executed: ${result.success ? '✅' : '❌'}`);
+}
+
+// Manual rebalancing
+const action = arbService.calculateRebalanceAction();
+if (action.type !== 'none') {
+  const result = await arbService.rebalance(action);
+  console.log(`Rebalance: ${result.success ? '✅' : '❌'} ${result.action.type}`);
+}
+```
+
+#### 批量清算多市场
+
+```typescript
+// Define multiple markets
+const markets = [
+  { name: 'Market 1', conditionId: '0x...', yesTokenId: '...', noTokenId: '...' },
+  { name: 'Market 2', conditionId: '0x...', yesTokenId: '...', noTokenId: '...' },
+  { name: 'Market 3', conditionId: '0x...', yesTokenId: '...', noTokenId: '...' },
+];
+
+// View all positions (no execution)
+const results = await arbService.settleMultiple(markets, false);
+for (const r of results) {
+  console.log(`${r.market.name}: ${r.pairedTokens} pairs, ${r.unpairedYes} unpaired YES`);
+}
+
+// Execute merge for all markets
+const settleResults = await arbService.settleMultiple(markets, true);
+const totalRecovered = settleResults.reduce((sum, r) => sum + (r.usdcRecovered || 0), 0);
 console.log(`Total recovered: $${totalRecovered}`);
 ```
 
-#### Monitor-only Mode (no wallet)
+#### 仅监控模式 (Monitor-only, no wallet)
 
 ```typescript
-// No private key = monitoring only
+// No private key = monitoring only, no execution
 const arbService = new ArbitrageService({
   profitThreshold: 0.003,
   enableLogging: true,
+  // No privateKey provided
 });
 
 arbService.on('opportunity', (opp) => {
-  console.log(`Found: ${opp.description}`);
+  // Log opportunities for analysis without executing
+  console.log(`Found ${opp.type} arb: ${opp.profitPercent.toFixed(2)}%`);
+  console.log(`  ${opp.description}`);
 });
 
 await arbService.start(market);
