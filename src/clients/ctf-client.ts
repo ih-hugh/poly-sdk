@@ -145,7 +145,8 @@ export interface MergeResult {
 export interface RedeemResult {
   success: boolean;
   txHash: string;
-  outcome: 'YES' | 'NO';
+  /** Winning outcome (e.g., 'YES', 'NO', 'Up', 'Down', 'Team1', 'Team2') */
+  outcome: string;
   tokensRedeemed: string;
   usdcReceived: string;
   gasUsed?: string;
@@ -167,7 +168,8 @@ export interface TokenIds {
 export interface MarketResolution {
   conditionId: string;
   isResolved: boolean;
-  winningOutcome?: 'YES' | 'NO';
+  /** Winning outcome (e.g., 'YES', 'NO') - determined by payout numerators */
+  winningOutcome?: string;
   payoutNumerators: [number, number];
   payoutDenominator: number;
 }
@@ -483,7 +485,7 @@ export class CTFClient {
    *
    * @see redeemByTokenIds - Use this for Polymarket CLOB markets
    */
-  async redeem(conditionId: string, outcome?: 'YES' | 'NO'): Promise<RedeemResult> {
+  async redeem(conditionId: string, outcome?: string): Promise<RedeemResult> {
     // Check resolution status
     const resolution = await this.getMarketResolution(conditionId);
     if (!resolution.isResolved) {
@@ -565,7 +567,7 @@ export class CTFClient {
   async redeemByTokenIds(
     conditionId: string,
     tokenIds: TokenIds,
-    outcome?: 'YES' | 'NO'
+    outcome?: string
   ): Promise<RedeemResult> {
     // Check resolution status
     const resolution = await this.getMarketResolution(conditionId);

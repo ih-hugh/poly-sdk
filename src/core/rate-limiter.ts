@@ -12,6 +12,7 @@ export enum ApiType {
   GAMMA_API = 'gamma-api',
   CLOB_API = 'clob-api',
   SUBGRAPH = 'subgraph',
+  BINANCE = 'binance',
 }
 
 const API_LIMITS: Record<ApiType, Bottleneck.ConstructorOptions> = {
@@ -32,6 +33,12 @@ const API_LIMITS: Record<ApiType, Bottleneck.ConstructorOptions> = {
   [ApiType.SUBGRAPH]: {
     minTime: 50, // 50ms minimum interval
     maxConcurrent: 10,
+  },
+  [ApiType.BINANCE]: {
+    // Binance allows 1200 requests/min, we use 10 req/s to be conservative
+    reservoir: 10,
+    reservoirRefreshAmount: 10,
+    reservoirRefreshInterval: 1000,
   },
 };
 

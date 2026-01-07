@@ -46,6 +46,9 @@ describe('MarketService Integration', () => {
 
     // Get token IDs
     const market = await service.getClobMarket(testConditionId);
+    if (!market) {
+      throw new Error(`Market not found: ${testConditionId}`);
+    }
     const yesToken = market.tokens.find((t: MarketToken) => t.outcome === 'Yes');
     const noToken = market.tokens.find((t: MarketToken) => t.outcome === 'No');
 
@@ -60,6 +63,11 @@ describe('MarketService Integration', () => {
   describe('getClobMarket', () => {
     it('should return valid market data from official client', async () => {
       const market = await service.getClobMarket(testConditionId);
+
+      expect(market).not.toBeNull();
+      if (!market) {
+        throw new Error(`Market not found: ${testConditionId}`);
+      }
 
       expect(market.conditionId).toBe(testConditionId);
       expect(typeof market.question).toBe('string');

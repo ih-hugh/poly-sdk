@@ -36,13 +36,44 @@ import type {
   RealtimeSpreadAnalysis,
   Side,
   Orderbook,
+  UnderlyingAsset,
+  TokenUnderlyingCorrelation,
+  TokenUnderlyingDataPoint,
 } from '../core/types.js';
+import type { BinanceService, BinanceInterval } from './binance-service.js';
 
 // CLOB Host
 const CLOB_HOST = 'https://clob.polymarket.com';
 
 // Chain IDs
 export const POLYGON_MAINNET = 137;
+
+/**
+ * Normalize timestamp to milliseconds.
+ * Polymarket API sometimes returns timestamps in seconds.
+ * Timestamps < 1e12 (year ~2001 in ms) are assumed to be in seconds.
+ */
+function normalizeTimestamp(ts: number): number {
+  return ts < 1e12 ? ts * 1000 : ts;
+}
+
+// Mapping from underlying asset to Binance symbol
+const UNDERLYING_TO_SYMBOL = {
+  BTC: 'BTCUSDT',
+  ETH: 'ETHUSDT',
+  SOL: 'SOLUSDT',
+} as const;
+
+// Map from KLineInterval to BinanceInterval (Binance doesn't support 30s or 12h)
+const KLINE_TO_BINANCE_INTERVAL: Partial<Record<KLineInterval, BinanceInterval>> = {
+  '1m': '1m',
+  '5m': '5m',
+  '15m': '15m',
+  '30m': '30m',
+  '1h': '1h',
+  '4h': '4h',
+  '1d': '1d',
+};
 
 // ============================================================================
 // Types
@@ -142,7 +173,8 @@ export class MarketService {
     private dataApi: DataApiClient | undefined,
     private rateLimiter: RateLimiter,
     private cache: UnifiedCache,
-    private config?: MarketServiceConfig
+    private config?: MarketServiceConfig,
+    private binanceService?: BinanceService
   ) {}
 
   // ============================================================================
@@ -173,13 +205,24 @@ export class MarketService {
   /**
    * Get market from CLOB by condition ID
    */
-  async getClobMarket(conditionId: string): Promise<Market> {
+  async getClobMarket(conditionId: string): Promise<Market | null> {
     const cacheKey = `clob:market:${conditionId}`;
     return this.cache.getOrSet(cacheKey, CACHE_TTL.MARKET_INFO, async () => {
       const client = await this.ensureInitialized();
       return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
-        const market = await client.getMarket(conditionId);
-        return this.normalizeClobMarket(market as ClobMarket);
+        try {
+          const market = await client.getMarket(conditionId);
+          if (!market || !market.tokens) {
+            return null;
+          }
+          return this.normalizeClobMarket(market as ClobMarket);
+        } catch (error) {
+          // Handle 404 "market not found" gracefully
+          if (error && typeof error === 'object' && 'status' in error && (error as { status: number }).status === 404) {
+            return null;
+          }
+          throw error;
+        }
       });
     });
   }
@@ -282,8 +325,12 @@ export class MarketService {
    */
   async getProcessedOrderbook(conditionId: string): Promise<ProcessedOrderbook> {
     const market = await this.getClobMarket(conditionId);
-    const yesToken = market.tokens.find(t => t.outcome === 'Yes');
-    const noToken = market.tokens.find(t => t.outcome === 'No');
+    if (!market) {
+      throw new PolymarketError(ErrorCode.MARKET_NOT_FOUND, `Market not found: ${conditionId}`);
+    }
+    // Use index-based access instead of name-based (supports Yes/No, Up/Down, Team1/Team2, etc.)
+    const yesToken = market.tokens[0];  // primary outcome
+    const noToken = market.tokens[1];   // secondary outcome
 
     if (!yesToken || !noToken) {
       throw new PolymarketError(ErrorCode.INVALID_RESPONSE, 'Missing tokens in market');
@@ -391,7 +438,10 @@ export class MarketService {
 
     try {
       const clobMarket = await this.getClobMarket(gammaMarket.conditionId);
-      return this.mergeMarkets(gammaMarket, clobMarket);
+      if (clobMarket) {
+        return this.mergeMarkets(gammaMarket, clobMarket);
+      }
+      return this.fromGammaMarket(gammaMarket);
     } catch {
       return this.fromGammaMarket(gammaMarket);
     }
@@ -451,16 +501,46 @@ export class MarketService {
 
   /**
    * Get K-Line candles for a market (single token)
+   *
+   * @param conditionId - Market condition ID
+   * @param interval - K-line interval (1s, 5s, 15s, 30s, 1m, 5m, 15m, 30m, 1h, 4h, 12h, 1d)
+   * @param options - Query options
+   * @param options.limit - Maximum number of trades to fetch for aggregation (default: 1000)
+   * @param options.tokenId - Filter by specific token ID
+   * @param options.outcomeIndex - Filter by outcome index (0 = primary, 1 = secondary)
+   * @param options.startTimestamp - Start timestamp (Unix ms) - filter trades after this time
+   * @param options.endTimestamp - End timestamp (Unix ms) - filter trades before this time
+   *
+   * @example
+   * ```typescript
+   * // Get 5s candles for the last 15 minutes
+   * const now = Date.now();
+   * const candles = await sdk.markets.getKLines(conditionId, '5s', {
+   *   startTimestamp: now - 15 * 60 * 1000,
+   *   endTimestamp: now,
+   * });
+   * ```
    */
   async getKLines(
     conditionId: string,
     interval: KLineInterval,
-    options?: { limit?: number; tokenId?: string; outcomeIndex?: number }
+    options?: {
+      limit?: number;
+      tokenId?: string;
+      outcomeIndex?: number;
+      startTimestamp?: number;
+      endTimestamp?: number;
+    }
   ): Promise<KLineCandle[]> {
     if (!this.dataApi) {
       throw new PolymarketError(ErrorCode.INVALID_CONFIG, 'DataApiClient is required for K-Line data');
     }
-    const trades = await this.dataApi.getTradesByMarket(conditionId, options?.limit || 1000);
+    const trades = await this.dataApi.getTrades({
+      market: conditionId,
+      limit: options?.limit || 1000,
+      startTimestamp: options?.startTimestamp,
+      endTimestamp: options?.endTimestamp,
+    });
 
     // Filter by token/outcome if specified
     let filteredTrades = trades;
@@ -475,21 +555,49 @@ export class MarketService {
 
   /**
    * Get dual K-Lines (YES + NO tokens)
+   *
+   * @param conditionId - Market condition ID
+   * @param interval - K-line interval (1s, 5s, 15s, 30s, 1m, 5m, 15m, 30m, 1h, 4h, 12h, 1d)
+   * @param options - Query options
+   * @param options.limit - Maximum number of trades to fetch for aggregation (default: 1000)
+   * @param options.startTimestamp - Start timestamp (Unix ms) - filter trades after this time
+   * @param options.endTimestamp - End timestamp (Unix ms) - filter trades before this time
+   *
+   * @example
+   * ```typescript
+   * // Get 15s dual K-lines for a 15-minute market
+   * const now = Date.now();
+   * const data = await sdk.markets.getDualKLines(conditionId, '15s', {
+   *   startTimestamp: now - 15 * 60 * 1000,
+   *   endTimestamp: now,
+   * });
+   * console.log(`Up candles: ${data.yes.length}, Down candles: ${data.no.length}`);
+   * ```
    */
   async getDualKLines(
     conditionId: string,
     interval: KLineInterval,
-    options?: { limit?: number }
+    options?: {
+      limit?: number;
+      startTimestamp?: number;
+      endTimestamp?: number;
+    }
   ): Promise<DualKLineData> {
     if (!this.dataApi) {
       throw new PolymarketError(ErrorCode.INVALID_CONFIG, 'DataApiClient is required for K-Line data');
     }
     const market = await this.getMarket(conditionId);
-    const trades = await this.dataApi.getTradesByMarket(conditionId, options?.limit || 1000);
+    const trades = await this.dataApi.getTrades({
+      market: conditionId,
+      limit: options?.limit || 1000,
+      startTimestamp: options?.startTimestamp,
+      endTimestamp: options?.endTimestamp,
+    });
 
-    // Separate trades by outcome
-    const yesTrades = trades.filter((t) => t.outcomeIndex === 0 || t.outcome === 'Yes');
-    const noTrades = trades.filter((t) => t.outcomeIndex === 1 || t.outcome === 'No');
+    // Separate trades by outcome using index (more reliable than name matching)
+    // outcomeIndex 0 = primary (Yes/Up/Team1), outcomeIndex 1 = secondary (No/Down/Team2)
+    const yesTrades = trades.filter((t) => t.outcomeIndex === 0);
+    const noTrades = trades.filter((t) => t.outcomeIndex === 1);
 
     const yesCandles = this.aggregateToKLines(yesTrades, interval);
     const noCandles = this.aggregateToKLines(noTrades, interval);
@@ -519,16 +627,253 @@ export class MarketService {
     };
   }
 
+  // ===== Token vs Underlying Correlation =====
+
+  /**
+   * Get aligned K-line data for token and underlying asset
+   *
+   * This method fetches K-line data from both Polymarket (token prices)
+   * and Binance (underlying asset prices), aligns them by timestamp,
+   * and optionally calculates Pearson correlation coefficients.
+   *
+   * @param conditionId - Market condition ID
+   * @param underlying - Underlying asset (BTC, ETH, SOL)
+   * @param interval - K-line interval (must be supported by both Poly and Binance)
+   * @param options - Optional parameters
+   * @returns Aligned data with optional correlation coefficients
+   *
+   * @example
+   * ```typescript
+   * const data = await marketService.getTokenUnderlyingData(
+   *   '0x123...',
+   *   'BTC',
+   *   '1h',
+   *   { limit: 100, calculateCorrelation: true }
+   * );
+   *
+   * // Access aligned data
+   * for (const point of data.data) {
+   *   console.log(`${point.timestamp}: Up=${point.upPrice}, BTC=${point.underlyingPrice}`);
+   * }
+   *
+   * // Check correlation
+   * if (data.correlation) {
+   *   console.log(`Correlation: ${data.correlation.upVsUnderlying}`);
+   * }
+   * ```
+   */
+  async getTokenUnderlyingData(
+    conditionId: string,
+    underlying: UnderlyingAsset,
+    interval: KLineInterval,
+    options?: {
+      limit?: number;
+      calculateCorrelation?: boolean;
+    }
+  ): Promise<TokenUnderlyingCorrelation> {
+    // Validate BinanceService is available
+    if (!this.binanceService) {
+      throw new PolymarketError(
+        ErrorCode.INVALID_CONFIG,
+        'BinanceService is required for token-underlying correlation analysis'
+      );
+    }
+
+    // Validate interval is supported by Binance
+    const binanceInterval = KLINE_TO_BINANCE_INTERVAL[interval];
+    if (!binanceInterval) {
+      throw new PolymarketError(
+        ErrorCode.INVALID_CONFIG,
+        `Interval ${interval} is not supported for correlation analysis. ` +
+        `Supported intervals: ${Object.keys(KLINE_TO_BINANCE_INTERVAL).join(', ')}`
+      );
+    }
+
+    const limit = options?.limit || 500;
+
+    // Fetch data in parallel
+    const [dualKLines, binanceKLines] = await Promise.all([
+      this.getDualKLines(conditionId, interval, { limit }),
+      this.binanceService.getKLines(
+        UNDERLYING_TO_SYMBOL[underlying],
+        binanceInterval,
+        { limit }
+      ),
+    ]);
+
+    // Create maps for quick lookup
+    const upMap = new Map(dualKLines.yes.map(c => [c.timestamp, c.close]));
+    const downMap = new Map(dualKLines.no.map(c => [c.timestamp, c.close]));
+    const binanceMap = new Map(binanceKLines.map(c => [c.timestamp, c.close]));
+
+    // Get all unique timestamps and sort them
+    const allTimestamps = new Set([
+      ...upMap.keys(),
+      ...downMap.keys(),
+      ...binanceMap.keys(),
+    ]);
+    const sortedTimestamps = [...allTimestamps].sort((a, b) => a - b);
+
+    // Find the first Binance price for calculating percentage change
+    const firstBinancePrice = binanceKLines.length > 0 ? binanceKLines[0].close : 0;
+
+    // Align data points
+    const alignedData: TokenUnderlyingDataPoint[] = [];
+    let lastUpPrice: number | undefined;
+    let lastDownPrice: number | undefined;
+    let lastBinancePrice: number | undefined;
+
+    for (const timestamp of sortedTimestamps) {
+      // Get prices, falling back to previous values if not available
+      const upPrice = upMap.get(timestamp) ?? this.findNearestPrice(timestamp, upMap, sortedTimestamps);
+      const downPrice = downMap.get(timestamp) ?? this.findNearestPrice(timestamp, downMap, sortedTimestamps);
+      const binancePrice = binanceMap.get(timestamp) ?? this.findNearestPrice(timestamp, binanceMap, sortedTimestamps);
+
+      // Update last known prices
+      if (upPrice !== undefined) lastUpPrice = upPrice;
+      if (downPrice !== undefined) lastDownPrice = downPrice;
+      if (binancePrice !== undefined) lastBinancePrice = binancePrice;
+
+      // Skip if we don't have underlying price
+      if (lastBinancePrice === undefined) continue;
+
+      const priceSum = (lastUpPrice !== undefined && lastDownPrice !== undefined)
+        ? lastUpPrice + lastDownPrice
+        : undefined;
+
+      const underlyingChange = firstBinancePrice > 0
+        ? ((lastBinancePrice - firstBinancePrice) / firstBinancePrice) * 100
+        : 0;
+
+      alignedData.push({
+        timestamp,
+        upPrice: lastUpPrice,
+        downPrice: lastDownPrice,
+        priceSum,
+        underlyingPrice: lastBinancePrice,
+        underlyingChange,
+      });
+    }
+
+    // Calculate correlation if requested
+    let correlation: TokenUnderlyingCorrelation['correlation'];
+    if (options?.calculateCorrelation && alignedData.length >= 2) {
+      correlation = this.calculatePearsonCorrelation(alignedData);
+    }
+
+    return {
+      conditionId,
+      underlying,
+      interval,
+      data: alignedData,
+      correlation,
+    };
+  }
+
+  /**
+   * Find the nearest available price for a timestamp
+   */
+  private findNearestPrice(
+    targetTimestamp: number,
+    priceMap: Map<number, number>,
+    sortedTimestamps: number[]
+  ): number | undefined {
+    if (priceMap.size === 0) return undefined;
+
+    // Find the nearest timestamp that has a price
+    let nearestTimestamp: number | undefined;
+    let minDiff = Infinity;
+
+    for (const ts of sortedTimestamps) {
+      if (priceMap.has(ts)) {
+        const diff = Math.abs(ts - targetTimestamp);
+        if (diff < minDiff) {
+          minDiff = diff;
+          nearestTimestamp = ts;
+        }
+      }
+    }
+
+    return nearestTimestamp !== undefined ? priceMap.get(nearestTimestamp) : undefined;
+  }
+
+  /**
+   * Calculate Pearson correlation coefficients
+   */
+  private calculatePearsonCorrelation(
+    data: TokenUnderlyingDataPoint[]
+  ): TokenUnderlyingCorrelation['correlation'] {
+    // Filter data points that have all required prices
+    const upData = data.filter(d => d.upPrice !== undefined && d.underlyingPrice !== undefined);
+    const downData = data.filter(d => d.downPrice !== undefined && d.underlyingPrice !== undefined);
+
+    const upVsUnderlying = this.pearson(
+      upData.map(d => d.upPrice!),
+      upData.map(d => d.underlyingPrice)
+    );
+
+    const downVsUnderlying = this.pearson(
+      downData.map(d => d.downPrice!),
+      downData.map(d => d.underlyingPrice)
+    );
+
+    return {
+      upVsUnderlying,
+      downVsUnderlying,
+    };
+  }
+
+  /**
+   * Calculate Pearson correlation coefficient between two arrays
+   * Returns a value between -1 and 1
+   */
+  private pearson(x: number[], y: number[]): number {
+    const n = Math.min(x.length, y.length);
+    if (n < 2) return 0;
+
+    // Calculate means
+    let sumX = 0, sumY = 0;
+    for (let i = 0; i < n; i++) {
+      sumX += x[i];
+      sumY += y[i];
+    }
+    const meanX = sumX / n;
+    const meanY = sumY / n;
+
+    // Calculate correlation
+    let numerator = 0;
+    let sumSqX = 0;
+    let sumSqY = 0;
+
+    for (let i = 0; i < n; i++) {
+      const dx = x[i] - meanX;
+      const dy = y[i] - meanY;
+      numerator += dx * dy;
+      sumSqX += dx * dx;
+      sumSqY += dy * dy;
+    }
+
+    const denominator = Math.sqrt(sumSqX * sumSqY);
+    if (denominator === 0) return 0;
+
+    return numerator / denominator;
+  }
+
   /**
    * Aggregate trades into K-Line candles
+   *
+   * Note: Polymarket API may return timestamps in seconds or milliseconds.
+   * This function normalizes all timestamps to milliseconds for consistent handling.
    */
   private aggregateToKLines(trades: Trade[], interval: KLineInterval): KLineCandle[] {
     const intervalMs = getIntervalMs(interval);
     const buckets = new Map<number, Trade[]>();
 
     // Group trades into time buckets
+    // Normalize timestamp to milliseconds (API sometimes returns seconds)
     for (const trade of trades) {
-      const bucketTime = Math.floor(trade.timestamp / intervalMs) * intervalMs;
+      const tradeTs = normalizeTimestamp(trade.timestamp);
+      const bucketTime = Math.floor(tradeTs / intervalMs) * intervalMs;
       const bucket = buckets.get(bucketTime) || [];
       bucket.push(trade);
       buckets.set(bucketTime, bucket);
@@ -539,8 +884,8 @@ export class MarketService {
     for (const [timestamp, bucketTrades] of buckets) {
       if (bucketTrades.length === 0) continue;
 
-      // Sort by timestamp for correct open/close
-      bucketTrades.sort((a, b) => a.timestamp - b.timestamp);
+      // Sort by normalized timestamp for correct open/close
+      bucketTrades.sort((a, b) => normalizeTimestamp(a.timestamp) - normalizeTimestamp(b.timestamp));
 
       const prices = bucketTrades.map((t) => t.price);
       const buyTrades = bucketTrades.filter((t) => t.side === 'BUY');
@@ -734,6 +1079,179 @@ export class MarketService {
       throw new PolymarketError(ErrorCode.INVALID_CONFIG, 'GammaApiClient is required for market search');
     }
     return this.gammaApi.getMarkets(params);
+  }
+
+  /**
+   * Scan for short-term crypto markets (Up/Down markets ending soon)
+   *
+   * ## Market Types
+   * Polymarket has short-term crypto markets in two durations:
+   * - **5-minute markets**: slug pattern `{coin}-updown-5m-{timestamp}`
+   * - **15-minute markets**: slug pattern `{coin}-updown-15m-{timestamp}`
+   *
+   * ## Slug Pattern
+   * The timestamp in the slug is the START time of the time window:
+   * - 15-minute markets: `{coin}-updown-15m-{Math.floor(startTime / 900) * 900}`
+   * - 5-minute markets: `{coin}-updown-5m-{Math.floor(startTime / 300) * 300}`
+   *
+   * Example: `btc-updown-15m-1767456000` starts at 1767456000 (16:00:00 UTC)
+   * and ends 15 minutes later at 1767456900 (16:15:00 UTC)
+   *
+   * ## Supported Coins
+   * - BTC (Bitcoin)
+   * - ETH (Ethereum)
+   * - SOL (Solana)
+   * - XRP (Ripple)
+   *
+   * ## Market Lifecycle Rules
+   * 1. Markets are created ahead of time (before they become tradeable)
+   * 2. New markets may not have prices yet (show 0.5/0.5)
+   * 3. When one market ends, the next one is already open for trading
+   * 4. A market ending doesn't mean no price - it means resolution is pending
+   *
+   * ## Outcomes
+   * All crypto short-term markets have:
+   * - outcomes: ["Up", "Down"]
+   * - Resolution based on price movement during the time window
+   *
+   * @param options - Scan options
+   * @param options.minMinutesUntilEnd - Minimum minutes until market ends (default: 5)
+   * @param options.maxMinutesUntilEnd - Maximum minutes until market ends (default: 60)
+   * @param options.limit - Maximum number of markets to return (default: 20)
+   * @param options.sortBy - Sort field: 'endDate' | 'volume' | 'liquidity' (default: 'endDate')
+   * @param options.duration - Filter by duration: '5m' | '15m' | 'all' (default: 'all')
+   * @param options.coin - Filter by coin: 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'all' (default: 'all')
+   * @returns Array of crypto short-term markets
+   *
+   * @example
+   * ```typescript
+   * // Find all 15-minute markets ending in 5-30 minutes
+   * const markets = await sdk.markets.scanCryptoShortTermMarkets({
+   *   minMinutesUntilEnd: 5,
+   *   maxMinutesUntilEnd: 30,
+   *   duration: '15m',
+   * });
+   *
+   * // Find BTC 5-minute markets only
+   * const btcMarkets = await sdk.markets.scanCryptoShortTermMarkets({
+   *   coin: 'BTC',
+   *   duration: '5m',
+   * });
+   * ```
+   */
+  async scanCryptoShortTermMarkets(options?: {
+    minMinutesUntilEnd?: number;
+    maxMinutesUntilEnd?: number;
+    limit?: number;
+    sortBy?: 'endDate' | 'volume' | 'liquidity';
+    duration?: '5m' | '15m' | 'all';
+    coin?: 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'all';
+  }): Promise<GammaMarket[]> {
+    if (!this.gammaApi) {
+      throw new PolymarketError(ErrorCode.INVALID_CONFIG, 'GammaApiClient is required for market scanning');
+    }
+
+    const {
+      minMinutesUntilEnd = 5,
+      maxMinutesUntilEnd = 60,
+      limit = 20,
+      sortBy = 'endDate',
+      duration = 'all',
+      coin = 'all',
+    } = options ?? {};
+
+    // Duration to interval seconds mapping
+    const durationIntervals: Record<string, number> = {
+      '5m': 300,   // 5 minutes in seconds
+      '15m': 900,  // 15 minutes in seconds
+    };
+
+    // Supported coins
+    const allCoins = ['btc', 'eth', 'sol', 'xrp'] as const;
+    const targetCoins = coin === 'all' ? allCoins : [coin.toLowerCase()];
+
+    // Target durations
+    const targetDurations = duration === 'all' ? ['5m', '15m'] : [duration];
+
+    // Calculate time slots to fetch
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const minEndSeconds = nowSeconds + minMinutesUntilEnd * 60;
+    const maxEndSeconds = nowSeconds + maxMinutesUntilEnd * 60;
+
+    // Generate slugs for all combinations
+    const slugsToFetch: string[] = [];
+
+    for (const dur of targetDurations) {
+      const intervalSeconds = durationIntervals[dur];
+      const durationStr = dur.replace('m', 'm'); // 5m or 15m
+
+      // Calculate the current slot and extend to cover the time range
+      // The slug timestamp is the START time, endTime = startTime + interval
+      // So if we want markets ending after minEndSeconds:
+      //   startTime + interval >= minEndSeconds => startTime >= minEndSeconds - interval
+      // And ending before maxEndSeconds:
+      //   startTime + interval <= maxEndSeconds => startTime <= maxEndSeconds - interval
+
+      const minSlotStart = Math.floor((minEndSeconds - intervalSeconds) / intervalSeconds) * intervalSeconds;
+      const maxSlotStart = Math.ceil(maxEndSeconds / intervalSeconds) * intervalSeconds;
+
+      // Generate slots from minSlotStart to maxSlotStart
+      for (let slotStart = minSlotStart; slotStart <= maxSlotStart; slotStart += intervalSeconds) {
+        for (const coinName of targetCoins) {
+          slugsToFetch.push(`${coinName}-updown-${durationStr}-${slotStart}`);
+        }
+      }
+    }
+
+    // Fetch markets in parallel batches
+    const BATCH_SIZE = 10;
+    const allMarkets: GammaMarket[] = [];
+
+    for (let i = 0; i < slugsToFetch.length; i += BATCH_SIZE) {
+      const batch = slugsToFetch.slice(i, i + BATCH_SIZE);
+      const results = await Promise.all(
+        batch.map(async (slug) => {
+          try {
+            const markets = await this.gammaApi!.getMarkets({ slug, limit: 1 });
+            return markets.length > 0 ? markets[0] : null;
+          } catch {
+            return null;
+          }
+        })
+      );
+
+      for (const market of results) {
+        if (market && market.active && !market.closed) {
+          allMarkets.push(market);
+        }
+      }
+    }
+
+    // Filter by end time range
+    const nowMs = Date.now();
+    const minEndTime = nowMs + minMinutesUntilEnd * 60 * 1000;
+    const maxEndTime = nowMs + maxMinutesUntilEnd * 60 * 1000;
+
+    const filteredMarkets = allMarkets.filter((market) => {
+      const endTime = market.endDate ? new Date(market.endDate).getTime() : 0;
+      return endTime >= minEndTime && endTime <= maxEndTime;
+    });
+
+    // Sort by preference
+    if (sortBy === 'volume') {
+      filteredMarkets.sort((a, b) => (b.volume24hr ?? 0) - (a.volume24hr ?? 0));
+    } else if (sortBy === 'liquidity') {
+      filteredMarkets.sort((a, b) => (b.liquidity ?? 0) - (a.liquidity ?? 0));
+    } else {
+      // Sort by endDate (soonest first)
+      filteredMarkets.sort((a, b) => {
+        const aEnd = a.endDate ? new Date(a.endDate).getTime() : Infinity;
+        const bEnd = b.endDate ? new Date(b.endDate).getTime() : Infinity;
+        return aEnd - bEnd;
+      });
+    }
+
+    return filteredMarkets.slice(0, limit);
   }
 
   // ===== Market Signal Detection =====
@@ -936,10 +1454,12 @@ export class MarketService {
   }
 
   private fromGammaMarket(gamma: GammaMarket): UnifiedMarket {
-    // Create tokens from Gamma outcomes (binary market: Yes/No)
+    // Create tokens from Gamma outcomes - use actual outcome names from gamma data
+    // This supports Yes/No, Up/Down, Team1/Team2, Heads/Tails, etc.
+    const outcomes = gamma.outcomes || ['Yes', 'No'];
     const tokens: UnifiedMarketToken[] = [
-      { tokenId: '', outcome: 'Yes', price: gamma.outcomePrices[0] || 0.5 },
-      { tokenId: '', outcome: 'No', price: gamma.outcomePrices[1] || 0.5 },
+      { tokenId: '', outcome: outcomes[0], price: gamma.outcomePrices[0] || 0.5 },
+      { tokenId: '', outcome: outcomes[1], price: gamma.outcomePrices[1] || 0.5 },
     ];
 
     return {
@@ -994,11 +1514,17 @@ export class MarketService {
 
 export function getIntervalMs(interval: KLineInterval): number {
   const map: Record<KLineInterval, number> = {
+    // Second-level intervals (for 15-minute crypto markets)
+    '1s': 1 * 1000,
+    '5s': 5 * 1000,
+    '15s': 15 * 1000,
     '30s': 30 * 1000,
+    // Minute-level intervals
     '1m': 60 * 1000,
     '5m': 5 * 60 * 1000,
     '15m': 15 * 60 * 1000,
     '30m': 30 * 60 * 1000,
+    // Hour-level intervals
     '1h': 60 * 60 * 1000,
     '4h': 4 * 60 * 60 * 1000,
     '12h': 12 * 60 * 60 * 1000,

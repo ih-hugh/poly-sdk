@@ -56,7 +56,7 @@ export interface Position {
 
 export interface Activity {
   // Transaction type
-  type: 'TRADE' | 'SPLIT' | 'MERGE' | 'REDEEM' | 'CONVERSION';
+  type: 'TRADE' | 'SPLIT' | 'MERGE' | 'REDEEM' | 'REWARD' | 'CONVERSION';
   side: 'BUY' | 'SELL';
 
   // Trade data
@@ -263,6 +263,10 @@ export interface TradesParams {
   filterAmount?: number;
   /** Trade side filter */
   side?: 'BUY' | 'SELL';
+  /** Start timestamp (Unix milliseconds) - filter trades after this time */
+  startTimestamp?: number;
+  /** End timestamp (Unix milliseconds) - filter trades before this time */
+  endTimestamp?: number;
 }
 
 /**
@@ -523,15 +527,24 @@ export class DataApiClient {
   /**
    * Get all activity for a wallet (auto-pagination)
    *
+   * **⚠️ IMPORTANT: API Limitation**
+   * The Polymarket API has a hard offset limit of 10,000. This means:
+   * - Maximum ~10,500 records can be retrieved via offset pagination
+   * - For active traders, this may only cover a few hours of history
+   * - Use `start` and `end` params for time-based filtering to access older data
+   *
    * @param address - Wallet address
-   * @param params - Query parameters
-   * @param maxItems - Maximum items to fetch (default: 10000)
+   * @param params - Query parameters (use `start`/`end` for time filtering)
+   * @param maxItems - Maximum items to fetch (default: 10000, capped by API offset limit)
    *
    * @example
    * ```typescript
-   * // Get all activity since a specific date
-   * const startDate = Math.floor(new Date('2024-12-01').getTime() / 1000);
-   * const allActivity = await client.getAllActivity(address, { start: startDate });
+   * // Get all recent activity (limited by API offset)
+   * const allActivity = await client.getAllActivity(address);
+   *
+   * // Get activity for a specific time window (recommended for complete history)
+   * const oneWeekAgo = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
+   * const weekActivity = await client.getAllActivity(address, { start: oneWeekAgo });
    * ```
    */
   async getAllActivity(
@@ -541,13 +554,22 @@ export class DataApiClient {
   ): Promise<Activity[]> {
     const all: Activity[] = [];
     const limit = 500; // Max allowed by API
+    const API_OFFSET_LIMIT = 10000; // Hard limit from Polymarket API
     let offset = 0;
 
-    while (all.length < maxItems) {
+    while (all.length < maxItems && offset < API_OFFSET_LIMIT) {
       const page = await this.getActivity(address, { ...params, limit, offset });
       all.push(...page);
       if (page.length < limit) break; // No more data
       offset += limit;
+    }
+
+    // Warn if we hit the API offset limit
+    if (offset >= API_OFFSET_LIMIT && all.length >= API_OFFSET_LIMIT) {
+      console.warn(
+        `[DataApiClient] Hit API offset limit (${API_OFFSET_LIMIT}). ` +
+          'Use time filtering (start/end params) to access older activity data.'
+      );
     }
 
     return all.slice(0, maxItems);
@@ -575,7 +597,11 @@ export class DataApiClient {
   async getTrades(params?: TradesParams): Promise<Trade[]> {
     return this.rateLimiter.execute(ApiType.DATA_API, async () => {
       const query = new URLSearchParams();
-      query.set('limit', String(params?.limit ?? 500));
+      // Request more if we need to filter by time (to ensure we get enough after filtering)
+      const requestLimit = (params?.startTimestamp || params?.endTimestamp)
+        ? Math.min((params?.limit ?? 500) * 3, 1000)
+        : (params?.limit ?? 500);
+      query.set('limit', String(requestLimit));
 
       // Basic filters
       if (params?.market) query.set('market', params.market);
@@ -596,7 +622,22 @@ export class DataApiClient {
           await response.json().catch(() => null)
         );
       const data = (await response.json()) as unknown[];
-      return this.normalizeTrades(data);
+      let trades = this.normalizeTrades(data);
+
+      // Apply timestamp filters client-side (API may not support these directly)
+      if (params?.startTimestamp) {
+        trades = trades.filter(t => t.timestamp >= params.startTimestamp!);
+      }
+      if (params?.endTimestamp) {
+        trades = trades.filter(t => t.timestamp <= params.endTimestamp!);
+      }
+
+      // Apply limit after filtering
+      if (params?.limit && trades.length > params.limit) {
+        trades = trades.slice(0, params.limit);
+      }
+
+      return trades;
     });
   }
 
@@ -791,12 +832,9 @@ export class DataApiClient {
         asset: String(p.asset || ''),
         conditionId: String(p.conditionId || ''),
         outcome: String(p.outcome || ''),
-        outcomeIndex:
-          typeof p.outcomeIndex === 'number'
-            ? p.outcomeIndex
-            : p.outcome === 'Yes'
-              ? 0
-              : 1,
+        // Only use outcomeIndex if provided by API - don't infer from outcome name
+        // (non-binary markets have arbitrary outcome names)
+        outcomeIndex: typeof p.outcomeIndex === 'number' ? p.outcomeIndex : 0,
 
         // Position data
         size: Number(p.size),
@@ -859,12 +897,8 @@ export class DataApiClient {
         icon: p.icon !== undefined ? String(p.icon) : undefined,
         eventSlug: p.eventSlug !== undefined ? String(p.eventSlug) : undefined,
         outcome: String(p.outcome || ''),
-        outcomeIndex:
-          typeof p.outcomeIndex === 'number'
-            ? p.outcomeIndex
-            : p.outcome === 'Yes'
-              ? 0
-              : 1,
+        // Only use outcomeIndex if provided by API - don't infer from outcome name
+        outcomeIndex: typeof p.outcomeIndex === 'number' ? p.outcomeIndex : 0,
         oppositeOutcome: p.oppositeOutcome !== undefined ? String(p.oppositeOutcome) : undefined,
         oppositeAsset: p.oppositeAsset !== undefined ? String(p.oppositeAsset) : undefined,
         endDate: p.endDate !== undefined ? String(p.endDate) : undefined,
@@ -925,12 +959,8 @@ export class DataApiClient {
         price: Number(t.price),
         size: Number(t.size),
         outcome: String(t.outcome || ''),
-        outcomeIndex:
-          typeof t.outcomeIndex === 'number'
-            ? t.outcomeIndex
-            : t.outcome === 'Yes'
-              ? 0
-              : 1,
+        // Only use outcomeIndex if provided by API - don't infer from outcome name
+        outcomeIndex: typeof t.outcomeIndex === 'number' ? t.outcomeIndex : 0,
 
         // Transaction info
         timestamp: this.normalizeTimestamp(t.timestamp),
@@ -994,16 +1024,41 @@ export class DataApiClient {
 
   private normalizeHolders(data: unknown[]): MarketHolder[] {
     if (!Array.isArray(data)) return [];
-    return data.map((item) => {
-      const h = item as Record<string, unknown>;
-      return {
-        proxyWallet: String(h.proxyWallet || h.address || ''),
-        size: Number(h.size) || 0,
-        outcome: String(h.outcome || ''),
-        value: h.value !== undefined ? Number(h.value) : undefined,
-        userName: h.userName !== undefined ? String(h.userName) : undefined,
-        profileImage: h.profileImage !== undefined ? String(h.profileImage) : undefined,
-      };
-    });
+
+    // The API returns grouped by token: [{ token, holders: [...] }, { token, holders: [...] }]
+    // We need to flatten this and normalize each holder
+    const result: MarketHolder[] = [];
+
+    for (const item of data) {
+      const tokenGroup = item as Record<string, unknown>;
+
+      // Check if this is the grouped format (has 'holders' array)
+      if (Array.isArray(tokenGroup.holders)) {
+        for (const holder of tokenGroup.holders as Record<string, unknown>[]) {
+          result.push({
+            proxyWallet: String(holder.proxyWallet || holder.address || ''),
+            size: Number(holder.amount || holder.size) || 0,
+            // Map outcomeIndex to outcome name (0 = Yes/Up, 1 = No/Down)
+            outcome: holder.outcomeIndex === 0 ? 'Yes' : holder.outcomeIndex === 1 ? 'No' : String(holder.outcome || ''),
+            value: holder.value !== undefined ? Number(holder.value) : undefined,
+            userName: holder.name !== undefined ? String(holder.name) : (holder.userName !== undefined ? String(holder.userName) : undefined),
+            profileImage: holder.profileImage !== undefined ? String(holder.profileImage) : undefined,
+          });
+        }
+      } else {
+        // Fallback: flat format (for backwards compatibility)
+        const h = tokenGroup;
+        result.push({
+          proxyWallet: String(h.proxyWallet || h.address || ''),
+          size: Number(h.amount || h.size) || 0,
+          outcome: h.outcomeIndex === 0 ? 'Yes' : h.outcomeIndex === 1 ? 'No' : String(h.outcome || ''),
+          value: h.value !== undefined ? Number(h.value) : undefined,
+          userName: h.name !== undefined ? String(h.name) : (h.userName !== undefined ? String(h.userName) : undefined),
+          profileImage: h.profileImage !== undefined ? String(h.profileImage) : undefined,
+        });
+      }
+    }
+
+    return result;
   }
 }

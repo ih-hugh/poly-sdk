@@ -949,7 +949,8 @@ export class ArbitrageService extends EventEmitter {
 
     // Check if market is resolved
     let marketStatus: 'active' | 'resolved' | 'unknown' = 'unknown';
-    let winningOutcome: 'YES' | 'NO' | undefined;
+    // winningOutcome can be any outcome name (YES/NO, Up/Down, Team1/Team2, etc.)
+    let winningOutcome: string | undefined;
 
     try {
       const resolution = await this.ctf.getMarketResolution(market.conditionId);
@@ -962,8 +963,13 @@ export class ArbitrageService extends EventEmitter {
         const cache = createUnifiedCache();
         const tempMarketService = new MarketService(undefined, undefined, this.rateLimiter, cache);
         const clobMarket = await tempMarketService.getClobMarket(market.conditionId);
-        marketStatus = clobMarket.closed ? 'resolved' : 'active';
-        this.log(`   Status: ${marketStatus} (from MarketService)`);
+        if (clobMarket) {
+          marketStatus = clobMarket.closed ? 'resolved' : 'active';
+          this.log(`   Status: ${marketStatus} (from MarketService)`);
+        } else {
+          this.log(`   Status: unknown (market not found, assuming active)`);
+          marketStatus = 'active';
+        }
       } catch {
         this.log(`   Status: unknown (assuming active)`);
         marketStatus = 'active';
@@ -1658,12 +1664,14 @@ export class ArbitrageService extends EventEmitter {
         let clobMarket;
         try {
           clobMarket = await tempMarketService.getClobMarket(gammaMarket.conditionId);
+          if (!clobMarket) continue; // Skip if market not found
         } catch {
           continue; // Skip if market data not available
         }
 
-        const yesToken = clobMarket.tokens.find((t: { outcome: string }) => t.outcome === 'Yes');
-        const noToken = clobMarket.tokens.find((t: { outcome: string }) => t.outcome === 'No');
+        // Use index-based access instead of name-based (supports Yes/No, Up/Down, Team1/Team2, etc.)
+        const yesToken = clobMarket.tokens[0];  // primary outcome
+        const noToken = clobMarket.tokens[1];   // secondary outcome
         if (!yesToken || !noToken) continue;
 
         // Get orderbook data

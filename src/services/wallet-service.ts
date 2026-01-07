@@ -143,6 +143,27 @@ export interface WalletProfile {
   lastActiveAt: Date;
 }
 
+export interface WalletActivityOptions {
+  /** Maximum number of activities to return */
+  limit?: number;
+  /** Pagination offset */
+  offset?: number;
+  /** Start timestamp (Unix seconds) - filter activities after this time */
+  start?: number;
+  /** End timestamp (Unix seconds) - filter activities before this time */
+  end?: number;
+  /** Filter by activity type */
+  type?: 'TRADE' | 'SPLIT' | 'MERGE' | 'REDEEM' | 'REWARD' | 'CONVERSION';
+  /** Filter by trade side */
+  side?: 'BUY' | 'SELL';
+  /** Filter by market conditionId */
+  market?: string;
+  /** Fetch all activities with auto-pagination (up to maxItems) */
+  fetchAll?: boolean;
+  /** Maximum items when fetchAll=true (default 10000) */
+  maxItems?: number;
+}
+
 export interface WalletActivitySummary {
   address: string;
   activities: Activity[];
@@ -152,6 +173,11 @@ export interface WalletActivitySummary {
     buyVolume: number;
     sellVolume: number;
     activeMarkets: string[];
+  };
+  /** Time range of returned activities */
+  timeRange?: {
+    earliest: Date;
+    latest: Date;
   };
 }
 
@@ -240,12 +266,71 @@ export class WalletService {
 
   /**
    * Get wallet activity with summary
+   *
+   * @param address - Wallet address
+   * @param options - Activity query options (limit, start, end, type, side, market, fetchAll)
+   *
+   * @example
+   * ```typescript
+   * // Get recent 100 activities
+   * const activity = await walletService.getWalletActivity(address);
+   *
+   * // Get activities from past week
+   * const oneWeekAgo = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
+   * const weekActivity = await walletService.getWalletActivity(address, { start: oneWeekAgo });
+   *
+   * // Get all activities (auto-pagination, up to API limit)
+   * const allActivity = await walletService.getWalletActivity(address, { fetchAll: true });
+   * ```
    */
-  async getWalletActivity(address: string, limit = 100): Promise<WalletActivitySummary> {
-    const activities = await this.dataApi.getActivity(address, { limit });
+  async getWalletActivity(
+    address: string,
+    options: WalletActivityOptions | number = 100
+  ): Promise<WalletActivitySummary> {
+    // Support legacy signature: getWalletActivity(address, limit)
+    const opts: WalletActivityOptions =
+      typeof options === 'number' ? { limit: options } : options;
+
+    let activities: Activity[];
+
+    if (opts.fetchAll) {
+      // Use getAllActivity for complete history with auto-pagination
+      activities = await this.dataApi.getAllActivity(
+        address,
+        {
+          start: opts.start,
+          end: opts.end,
+          type: opts.type,
+          side: opts.side,
+          market: opts.market ? [opts.market] : undefined,
+        },
+        opts.maxItems || 10000
+      );
+    } else {
+      // Use getActivity for single page
+      activities = await this.dataApi.getActivity(address, {
+        limit: opts.limit || 100,
+        offset: opts.offset,
+        start: opts.start,
+        end: opts.end,
+        type: opts.type,
+        side: opts.side,
+        market: opts.market ? [opts.market] : undefined,
+      });
+    }
 
     const buys = activities.filter((a) => a.side === 'BUY');
     const sells = activities.filter((a) => a.side === 'SELL');
+
+    // Calculate time range
+    let timeRange: { earliest: Date; latest: Date } | undefined;
+    if (activities.length > 0) {
+      const timestamps = activities.map((a) => a.timestamp);
+      timeRange = {
+        earliest: new Date(Math.min(...timestamps)),
+        latest: new Date(Math.max(...timestamps)),
+      };
+    }
 
     return {
       address,
@@ -257,6 +342,7 @@ export class WalletService {
         sellVolume: sells.reduce((sum, a) => sum + (a.usdcSize || 0), 0),
         activeMarkets: [...new Set(activities.map((a) => a.conditionId))],
       },
+      timeRange,
     };
   }
 
@@ -306,7 +392,8 @@ export class WalletService {
     period: TimePeriod,
     limit = 50,
     sortBy: LeaderboardSortBy = 'pnl',
-    category: LeaderboardCategory = 'OVERALL'
+    category: LeaderboardCategory = 'OVERALL',
+    offset = 0
   ): Promise<PeriodLeaderboardEntry[]> {
     // Map lowercase period to API's uppercase format
     const timePeriodMap: Record<TimePeriod, LeaderboardTimePeriod> = {
@@ -331,6 +418,7 @@ export class WalletService {
       orderBy,
       category,
       limit,
+      offset,
     });
 
     // Map to PeriodLeaderboardEntry format

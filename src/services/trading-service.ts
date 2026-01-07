@@ -37,6 +37,23 @@ export const POLYGON_AMOY = 80002;
 const CLOB_HOST = 'https://clob.polymarket.com';
 
 // ============================================================================
+// Polymarket Order Minimums
+// ============================================================================
+// These are enforced by Polymarket's CLOB API. Orders below these limits will
+// be rejected with errors like:
+// - "invalid amount for a marketable BUY order ($X), min size: $1"
+// - "Size (X) lower than the minimum: 5"
+//
+// Strategies should ensure orders meet these requirements BEFORE sending.
+// ============================================================================
+
+/** Minimum order value in USDC (price * size >= MIN_ORDER_VALUE) */
+export const MIN_ORDER_VALUE_USDC = 1;
+
+/** Minimum order size in shares */
+export const MIN_ORDER_SIZE_SHARES = 5;
+
+// ============================================================================
 // Types
 // ============================================================================
 
@@ -169,8 +186,10 @@ export class TradingService {
     this.clobClient = new ClobClient(CLOB_HOST, this.chainId, this.wallet);
 
     // Get or create API credentials
+    // We use derive-first strategy (opposite of official createOrDeriveApiKey)
+    // because most users already have a key, avoiding unnecessary 400 error logs.
     if (!this.credentials) {
-      const creds = await this.clobClient.createOrDeriveApiKey();
+      const creds = await this.deriveOrCreateApiKey();
       this.credentials = {
         key: creds.key,
         secret: creds.secret,
@@ -191,6 +210,29 @@ export class TradingService {
     );
 
     this.initialized = true;
+  }
+
+  /**
+   * Try to derive existing API key first, create new one if not exists.
+   * This is the reverse of official createOrDeriveApiKey() to avoid
+   * 400 "Could not create api key" error log for existing keys.
+   */
+  private async deriveOrCreateApiKey(): Promise<{ key: string; secret: string; passphrase: string }> {
+    // First try to derive existing key (most common case for existing users)
+    const derived = await this.clobClient!.deriveApiKey();
+    if (derived.key) {
+      return derived;
+    }
+
+    // Derive failed (key doesn't exist), create new key (first-time users)
+    const created = await this.clobClient!.createApiKey();
+    if (!created.key) {
+      throw new PolymarketError(
+        ErrorCode.AUTH_FAILED,
+        'Failed to create or derive API key. Wallet may not be registered on Polymarket.'
+      );
+    }
+    return created;
   }
 
   private async ensureInitialized(): Promise<ClobClient> {
@@ -238,8 +280,30 @@ export class TradingService {
 
   /**
    * Create and post a limit order
+   *
+   * Note: Polymarket enforces minimum order requirements:
+   * - Minimum size: 5 shares (MIN_ORDER_SIZE_SHARES)
+   * - Minimum value: $1 USDC (MIN_ORDER_VALUE_USDC)
+   *
+   * Orders below these limits will be rejected by the API.
    */
   async createLimitOrder(params: LimitOrderParams): Promise<OrderResult> {
+    // Validate minimum order requirements before sending to API
+    if (params.size < MIN_ORDER_SIZE_SHARES) {
+      return {
+        success: false,
+        errorMsg: `Order size (${params.size}) is below Polymarket minimum (${MIN_ORDER_SIZE_SHARES} shares)`,
+      };
+    }
+
+    const orderValue = params.price * params.size;
+    if (orderValue < MIN_ORDER_VALUE_USDC) {
+      return {
+        success: false,
+        errorMsg: `Order value ($${orderValue.toFixed(2)}) is below Polymarket minimum ($${MIN_ORDER_VALUE_USDC})`,
+      };
+    }
+
     const client = await this.ensureInitialized();
 
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
@@ -286,8 +350,21 @@ export class TradingService {
 
   /**
    * Create and post a market order
+   *
+   * Note: Polymarket enforces minimum order requirements:
+   * - Minimum value: $1 USDC (MIN_ORDER_VALUE_USDC)
+   *
+   * Market orders below this limit will be rejected by the API.
    */
   async createMarketOrder(params: MarketOrderParams): Promise<OrderResult> {
+    // Validate minimum order value before sending to API
+    if (params.amount < MIN_ORDER_VALUE_USDC) {
+      return {
+        success: false,
+        errorMsg: `Order amount ($${params.amount.toFixed(2)}) is below Polymarket minimum ($${MIN_ORDER_VALUE_USDC})`,
+      };
+    }
+
     const client = await this.ensureInitialized();
 
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {

@@ -145,6 +145,24 @@ export interface GammaMarket {
   endDate: Date;
 
   /**
+   * When the market was created
+   * @remarks For crypto 15m markets, this is ~24h before trading starts
+   */
+  createdAt?: Date;
+
+  /**
+   * When the market became ready (NOT trading start time!)
+   * @remarks For crypto 15m markets, this is close to createdAt.
+   * The actual trading start time should be parsed from the slug.
+   */
+  startDate?: Date;
+
+  /**
+   * When the market started accepting orders
+   */
+  acceptingOrdersTimestamp?: Date;
+
+  /**
    * Whether the market is currently active
    */
   active: boolean;
@@ -263,6 +281,12 @@ export interface MarketSearchParams {
    * Sort direction (true = ascending, false = descending)
    */
   ascending?: boolean;
+
+  /**
+   * Filter by tag (e.g., "15-min", "5-min", "hourly", "daily")
+   * Used for recurring short-term markets
+   */
+  tag?: string;
 }
 
 // ===== Client =====
@@ -346,6 +370,7 @@ export class GammaApiClient {
     if (params?.order) query.set('order', params.order);
     if (params?.ascending !== undefined)
       query.set('ascending', String(params.ascending));
+    if (params?.tag) query.set('tag', params.tag);
 
     return this.rateLimiter.execute(ApiType.GAMMA_API, async () => {
       const response = await fetch(`${GAMMA_API_BASE}/markets?${query}`);
@@ -559,6 +584,11 @@ export class GammaApiClient {
       bestBid: m.bestBid !== undefined ? Number(m.bestBid) : undefined,
       bestAsk: m.bestAsk !== undefined ? Number(m.bestAsk) : undefined,
       endDate: new Date(String(m.endDate || Date.now())),
+      createdAt: m.createdAt ? new Date(String(m.createdAt)) : undefined,
+      startDate: m.startDate ? new Date(String(m.startDate)) : undefined,
+      acceptingOrdersTimestamp: m.acceptingOrdersTimestamp
+        ? new Date(String(m.acceptingOrdersTimestamp))
+        : undefined,
       active: Boolean(m.active),
       closed: Boolean(m.closed),
       image: m.image ? String(m.image) : undefined,

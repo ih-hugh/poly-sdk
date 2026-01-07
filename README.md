@@ -26,6 +26,7 @@
   - [WalletService](#walletservice)
   - [SmartMoneyService](#smartmoneyservice)
   - [ArbitrageService](#arbitrageservice)
+  - [DipArbService](#diparbservice)
 - [Low-Level Clients](#low-level-clients)
 - [Breaking Changes (v0.3.0)](#breaking-changes-v030)
 - [Examples](#examples)
@@ -110,6 +111,12 @@ poly-sdk Architecture
 │  │  • Market scanning  • Auto execution  • Rebalancer  • Smart clearing    │ │
 │  └─────────────────────────────────────────────────────────────────────────┘ │
 │                                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                         DipArbService                                    │ │
+│  │  ─────────────────────────────────────────────────────────────────────  │ │
+│  │  • 15m crypto UP/DOWN  • Dip detection  • Auto-rotate  • Background redeem│
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                               │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │                                                                               │
 │  Layer 2: Low-Level Clients (Advanced Users / Raw API Access)                │
@@ -152,6 +159,7 @@ poly-sdk Architecture
 | **WalletService** | Wallet/trader analysis |
 | **SmartMoneyService** | Smart money tracking |
 | **ArbitrageService** | Arbitrage detection & execution |
+| **DipArbService** | Dip arbitrage for 15m crypto markets |
 
 ---
 
@@ -247,6 +255,7 @@ sdk.markets         // Market data
 sdk.wallets         // Wallet analysis
 sdk.realtime        // WebSocket real-time data
 sdk.smartMoney      // Smart money tracking & copy trading
+sdk.dipArb          // Dip arbitrage for 15m crypto markets
 sdk.dataApi         // Direct Data API access
 sdk.gammaApi        // Direct Gamma API access
 sdk.subgraph        // On-chain data via Goldsky
@@ -639,6 +648,107 @@ console.log(`Recovered: $${clearResult.totalUsdcRecovered.toFixed(2)}`);
 
 ---
 
+### DipArbService
+
+**Dip Arbitrage** for Polymarket 15-minute crypto UP/DOWN markets (BTC, ETH, SOL, XRP).
+
+**Strategy**: Detect sudden price dips → Buy dipped side (Leg1) → Wait for opposite to drop → Buy opposite (Leg2) → Lock profit (UP + DOWN = $1)
+
+#### Quick Start
+
+```bash
+# One command to start auto trading
+PRIVATE_KEY=0x... npx tsx scripts/dip-arb/auto-trade.ts
+```
+
+#### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Dip Detection** | Detects 15%+ price drops within 10s sliding window |
+| **Two-Leg Execution** | Leg1 (buy dip) + Leg2 (buy opposite when cost < target) |
+| **Auto-Rotate** | Automatically switches to next market when current ends |
+| **Background Redeem** | Waits for Oracle resolution (~5min) then redeems winning positions |
+| **WebSocket Reconnect** | Auto re-subscribes on disconnect |
+
+#### Programmatic Usage
+
+```typescript
+import { PolymarketSDK } from '@catalyst-team/poly-sdk';
+
+const sdk = new PolymarketSDK({ privateKey: '0x...' });
+
+// Configure strategy
+sdk.dipArb.updateConfig({
+  shares: 10,              // Shares per trade
+  sumTarget: 0.9,          // Leg2 triggers when cost ≤ 0.9 (11% profit)
+  dipThreshold: 0.15,      // 15% dip triggers Leg1
+  windowMinutes: 14,       // Trade window after round start
+  autoExecute: true,       // Auto-execute signals
+});
+
+// Listen to events
+sdk.dipArb.on('signal', (signal) => {
+  console.log(`${signal.type}: ${signal.side} @ ${signal.price}`);
+});
+
+sdk.dipArb.on('execution', (result) => {
+  console.log(`${result.leg} ${result.success ? '✅' : '❌'}`);
+});
+
+sdk.dipArb.on('roundComplete', (result) => {
+  console.log(`Profit: $${result.profit?.toFixed(2)}`);
+});
+
+// Find and start monitoring
+const market = await sdk.dipArb.findAndStart({
+  coin: 'ETH',
+  preferDuration: '15m',
+});
+
+// Enable auto-rotate with redemption
+sdk.dipArb.enableAutoRotate({
+  enabled: true,
+  underlyings: ['ETH'],
+  duration: '15m',
+  settleStrategy: 'redeem',
+  redeemWaitMinutes: 5,
+});
+
+// Get stats
+const stats = sdk.dipArb.getStats();
+console.log(`Signals: ${stats.signalsDetected}, L1: ${stats.leg1Filled}, L2: ${stats.leg2Filled}`);
+
+// Cleanup
+await sdk.dipArb.stop();
+sdk.stop();
+```
+
+#### Events
+
+| Event | Data | Description |
+|-------|------|-------------|
+| `started` | `DipArbMarketConfig` | Started monitoring market |
+| `stopped` | - | Stopped monitoring |
+| `newRound` | `{ roundId, upOpen, downOpen }` | New trading round |
+| `signal` | `DipArbSignalEvent` | Leg1/Leg2 signal detected |
+| `execution` | `DipArbExecutionResult` | Trade execution result |
+| `roundComplete` | `{ profit, profitRate }` | Round finished |
+| `rotate` | `{ reason, newMarket }` | Switched to new market |
+| `settled` | `{ success, amountReceived }` | Position redeemed |
+
+#### Scripts
+
+```bash
+# Auto trading (monitors + trades)
+PRIVATE_KEY=0x... npx tsx scripts/dip-arb/auto-trade.ts
+
+# Redeem ended positions
+PRIVATE_KEY=0x... npx tsx scripts/dip-arb/redeem-positions.ts
+```
+
+---
+
 ## Low-Level Clients
 
 For advanced users who need direct API access:
@@ -736,6 +846,13 @@ pnpm example:arb-service  # Arbitrage service
 | [11-live-arbitrage-scan.ts](examples/11-live-arbitrage-scan.ts) | Scan markets for opportunities |
 | [12-trending-arb-monitor.ts](examples/12-trending-arb-monitor.ts) | Real-time trending monitor |
 | [13-arbitrage-service.ts](examples/13-arbitrage-service.ts) | Full arbitrage workflow |
+| [14-dip-arb-service.ts](examples/14-dip-arb-service.ts) | Dip arbitrage for 15m crypto |
+
+**DipArb Scripts** (in `scripts/dip-arb/`):
+| Script | Description |
+|--------|-------------|
+| [auto-trade.ts](scripts/dip-arb/auto-trade.ts) | One-click auto trading with rotation |
+| [redeem-positions.ts](scripts/dip-arb/redeem-positions.ts) | Redeem ended market positions |
 
 ---
 
@@ -798,6 +915,14 @@ import type {
   ArbitrageServiceConfig,
   ScanResult,
   ClearPositionResult,
+
+  // DipArb
+  DipArbServiceConfig,
+  DipArbMarketConfig,
+  DipArbSignalEvent,
+  DipArbExecutionResult,
+  DipArbRoundState,
+  DipArbStats,
 } from '@catalyst-team/poly-sdk';
 ```
 

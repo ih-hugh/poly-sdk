@@ -259,6 +259,9 @@ export class RealtimeServiceV2 extends EventEmitter {
   private subscriptionIdCounter = 0;
   private connected = false;
 
+  // Store subscription messages for reconnection
+  private subscriptionMessages: Map<string, { subscriptions: Array<{ topic: string; type: string; filters?: string; clob_auth?: ClobApiKeyCreds }> }> = new Map();
+
   // Caches
   private priceCache: Map<string, PriceUpdate> = new Map();
   private bookCache: Map<string, OrderbookSnapshot> = new Map();
@@ -307,6 +310,7 @@ export class RealtimeServiceV2 extends EventEmitter {
       this.client = null;
       this.connected = false;
       this.subscriptions.clear();
+      this.subscriptionMessages.clear();  // Clear reconnection list
     }
   }
 
@@ -338,7 +342,9 @@ export class RealtimeServiceV2 extends EventEmitter {
       { topic: 'clob_market', type: 'tick_size_change', filters: filterStr },
     ];
 
-    this.sendSubscription({ subscriptions });
+    const subMsg = { subscriptions };
+    this.sendSubscription(subMsg);
+    this.subscriptionMessages.set(subId, subMsg);  // Store for reconnection
 
     // Register handlers
     const orderbookHandler = (book: OrderbookSnapshot) => {
@@ -382,6 +388,7 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('tickSizeChange', tickSizeHandler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subscriptionMessages.delete(subId);  // Remove from reconnection list
       },
     };
 
@@ -664,7 +671,9 @@ export class RealtimeServiceV2 extends EventEmitter {
       filters: JSON.stringify({ symbol }),
     }));
 
-    this.sendSubscription({ subscriptions });
+    const subMsg = { subscriptions };
+    this.sendSubscription(subMsg);
+    this.subscriptionMessages.set(subId, subMsg);  // Store for reconnection
 
     const handler = (price: CryptoPrice) => {
       if (symbols.includes(price.symbol)) {
@@ -681,6 +690,7 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('cryptoChainlinkPrice', handler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subscriptionMessages.delete(subId);  // Remove from reconnection list
       },
     };
 
@@ -880,6 +890,7 @@ export class RealtimeServiceV2 extends EventEmitter {
       sub.unsubscribe();
     }
     this.subscriptions.clear();
+    this.subscriptionMessages.clear();  // Clear reconnection list
   }
 
   // ============================================================================
@@ -889,6 +900,16 @@ export class RealtimeServiceV2 extends EventEmitter {
   private handleConnect(client: RealTimeDataClient): void {
     this.connected = true;
     this.log('Connected to WebSocket server');
+
+    // Re-subscribe to all active subscriptions on reconnect
+    if (this.subscriptionMessages.size > 0) {
+      this.log(`Re-subscribing to ${this.subscriptionMessages.size} subscriptions...`);
+      for (const [subId, msg] of this.subscriptionMessages) {
+        this.log(`Re-subscribing: ${subId}`);
+        this.client?.subscribe(msg);
+      }
+    }
+
     this.emit('connected');
   }
 
@@ -1030,7 +1051,7 @@ export class RealtimeServiceV2 extends EventEmitter {
       price: Number(payload.price) || 0,
       side: payload.side as 'BUY' | 'SELL',
       size: Number(payload.size) || 0,
-      timestamp: Number(payload.timestamp) || timestamp,
+      timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
       transactionHash: payload.transactionHash as string || '',
       trader: {
         name: payload.name as string | undefined,
@@ -1044,7 +1065,7 @@ export class RealtimeServiceV2 extends EventEmitter {
     const price: CryptoPrice = {
       symbol: payload.symbol as string || '',
       price: Number(payload.value) || 0,
-      timestamp: Number(payload.timestamp) || timestamp,
+      timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
     };
     this.emit('cryptoPrice', price);
   }
@@ -1053,7 +1074,7 @@ export class RealtimeServiceV2 extends EventEmitter {
     const price: CryptoPrice = {
       symbol: payload.symbol as string || '',
       price: Number(payload.value) || 0,
-      timestamp: Number(payload.timestamp) || timestamp,
+      timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
     };
     this.emit('cryptoChainlinkPrice', price);
   }
@@ -1062,7 +1083,7 @@ export class RealtimeServiceV2 extends EventEmitter {
     const price: EquityPrice = {
       symbol: payload.symbol as string || '',
       price: Number(payload.value) || 0,
-      timestamp: Number(payload.timestamp) || timestamp,
+      timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
     };
     this.emit('equityPrice', price);
   }
@@ -1138,7 +1159,7 @@ export class RealtimeServiceV2 extends EventEmitter {
       market: payload.market as string || '',
       bids,
       asks,
-      timestamp: parseInt(payload.timestamp as string, 10) || timestamp,
+      timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
       tickSize: payload.tick_size as string || '0.01',
       minOrderSize: payload.min_order_size as string || '1',
       hash: payload.hash as string || '',
@@ -1160,7 +1181,7 @@ export class RealtimeServiceV2 extends EventEmitter {
       price: parseFloat(payload.price as string) || 0,
       side: payload.side as 'BUY' | 'SELL' || 'BUY',
       size: parseFloat(payload.size as string) || 0,
-      timestamp: parseInt(payload.timestamp as string, 10) || timestamp,
+      timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
     };
   }
 
@@ -1221,5 +1242,23 @@ export class RealtimeServiceV2 extends EventEmitter {
     if (this.config.debug) {
       console.log(`[RealtimeService] ${message}`);
     }
+  }
+
+  /**
+   * Normalize timestamp to milliseconds
+   * Polymarket WebSocket returns timestamps in seconds, need to convert to milliseconds
+   */
+  private normalizeTimestamp(ts: unknown): number {
+    if (typeof ts === 'string') {
+      const parsed = parseInt(ts, 10);
+      if (isNaN(parsed)) return Date.now();
+      // If timestamp is in seconds (< 1e12), convert to milliseconds
+      return parsed < 1e12 ? parsed * 1000 : parsed;
+    }
+    if (typeof ts === 'number') {
+      // If timestamp is in seconds (< 1e12), convert to milliseconds
+      return ts < 1e12 ? ts * 1000 : ts;
+    }
+    return Date.now();
   }
 }

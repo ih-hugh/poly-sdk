@@ -26,9 +26,10 @@
  * 验证跟单结果请使用 TradingService.getTrades()
  */
 
-import type { WalletService } from './wallet-service.js';
+import type { WalletService, TimePeriod, PeriodLeaderboardEntry } from './wallet-service.js';
 import type { RealtimeServiceV2, ActivityTrade } from './realtime-service-v2.js';
 import type { TradingService, OrderResult } from './trading-service.js';
+import type { Position } from '../clients/data-api.js';
 
 // ============================================================================
 // Types
@@ -131,6 +132,136 @@ export interface SmartMoneyServiceConfig {
   minPnl?: number;
   /** Cache TTL (default: 300000 = 5 min) */
   cacheTtl?: number;
+}
+
+// ============================================================================
+// Leaderboard & Report Types
+// ============================================================================
+
+/**
+ * Leaderboard query options
+ */
+export interface LeaderboardOptions {
+  /** Time period: 'day' | 'week' | 'month' | 'all' */
+  period?: TimePeriod;
+  /** Maximum entries (default: 50, max: 500) */
+  limit?: number;
+  /** Sort by: 'pnl' | 'volume' */
+  sortBy?: 'pnl' | 'volume';
+  /** Pagination offset (default: 0, max: 10000) */
+  offset?: number;
+}
+
+/**
+ * Smart Money Leaderboard entry (simplified from PeriodLeaderboardEntry)
+ */
+export interface SmartMoneyLeaderboardEntry {
+  address: string;
+  rank: number;
+  pnl: number;
+  volume: number;
+  tradeCount: number;
+  userName?: string;
+  profileImage?: string;
+}
+
+/**
+ * Period ranking info
+ */
+export interface PeriodRanking {
+  rank: number;
+  pnl: number;
+  volume: number;
+}
+
+/**
+ * Wallet report - comprehensive wallet analysis
+ */
+export interface WalletReport {
+  address: string;
+  generatedAt: Date;
+
+  overview: {
+    totalPnL: number;
+    realizedPnL: number;
+    unrealizedPnL: number;
+    positionCount: number;
+    tradeCount: number;
+    smartScore: number;
+    lastActiveAt: Date;
+  };
+
+  rankings: {
+    daily: PeriodRanking | null;
+    weekly: PeriodRanking | null;
+    monthly: PeriodRanking | null;
+    allTime: PeriodRanking | null;
+  };
+
+  performance: {
+    winRate: number;
+    winCount: number;
+    lossCount: number;
+    avgPositionSize: number;
+    avgWinAmount: number;
+    avgLossAmount: number;
+    uniqueMarkets: number;
+  };
+
+  categoryBreakdown: Array<{
+    category: string;
+    positionCount: number;
+    totalPnl: number;
+  }>;
+
+  topPositions: Array<{
+    market: string;
+    slug?: string;
+    outcome: string;
+    size: number;
+    avgPrice: number;
+    currentPrice?: number;
+    pnl: number;
+    percentPnl?: number;
+  }>;
+
+  recentTrades: Array<{
+    timestamp: number;
+    side: 'BUY' | 'SELL';
+    size: number;
+    price: number;
+    usdcSize?: number;
+    // Market info
+    title?: string;
+    slug?: string;
+    outcome?: string;
+    conditionId?: string;
+  }>;
+
+  activitySummary: {
+    totalBuys: number;
+    totalSells: number;
+    buyVolume: number;
+    sellVolume: number;
+    activeMarketsCount: number;
+  };
+}
+
+/**
+ * Wallet comparison result
+ */
+export interface WalletComparison {
+  period: TimePeriod;
+  generatedAt: Date;
+  wallets: Array<{
+    address: string;
+    userName?: string;
+    rank: number | null;
+    pnl: number;
+    volume: number;
+    positionCount: number;
+    winRate: number;
+  }>;
 }
 
 // ============================================================================
@@ -505,6 +636,272 @@ export class SmartMoneyService {
       stats,
       stop: () => subscription.unsubscribe(),
       getStats: () => ({ ...stats }),
+    };
+  }
+
+  // ============================================================================
+  // Leaderboard - 排行榜
+  // ============================================================================
+
+  /**
+   * Get leaderboard by time period
+   *
+   * @example
+   * ```typescript
+   * // Get weekly top 100 by PnL
+   * const leaderboard = await sdk.smartMoney.getLeaderboard({
+   *   period: 'week',
+   *   limit: 100,
+   *   sortBy: 'pnl'
+   * });
+   * ```
+   */
+  async getLeaderboard(options: LeaderboardOptions = {}): Promise<SmartMoneyLeaderboardEntry[]> {
+    const period = options.period ?? 'week';
+    const limit = Math.min(options.limit ?? 50, 500);
+    const sortBy = options.sortBy ?? 'pnl';
+    const offset = Math.min(options.offset ?? 0, 10000);
+
+    const entries = await this.walletService.getLeaderboardByPeriod(period, limit, sortBy, 'OVERALL', offset);
+
+    return entries.map(e => ({
+      address: e.address,
+      rank: e.rank,
+      pnl: e.pnl,
+      volume: e.volume,
+      tradeCount: e.tradeCount,
+      userName: e.userName,
+      profileImage: e.profileImage,
+    }));
+  }
+
+  // ============================================================================
+  // Wallet Report - 钱包报告
+  // ============================================================================
+
+  /**
+   * Generate comprehensive wallet report
+   *
+   * @example
+   * ```typescript
+   * const report = await sdk.smartMoney.getWalletReport('0x...');
+   * console.log(report.overview.totalPnL);
+   * console.log(report.rankings.weekly?.rank);
+   * ```
+   */
+  async getWalletReport(address: string): Promise<WalletReport> {
+    // Fetch all data in parallel
+    const [
+      profile,
+      positions,
+      activitySummary,
+      dailyPnl,
+      weeklyPnl,
+      monthlyPnl,
+      allTimePnl,
+    ] = await Promise.all([
+      this.walletService.getWalletProfile(address),
+      this.walletService.getWalletPositions(address),
+      this.walletService.getWalletActivity(address, 100),
+      this.walletService.getUserPeriodPnl(address, 'day').catch(() => null),
+      this.walletService.getUserPeriodPnl(address, 'week').catch(() => null),
+      this.walletService.getUserPeriodPnl(address, 'month').catch(() => null),
+      this.walletService.getUserPeriodPnl(address, 'all').catch(() => null),
+    ]);
+
+    // Calculate performance metrics
+    const winningPositions = positions.filter(p => (p.cashPnl ?? 0) > 0);
+    const losingPositions = positions.filter(p => (p.cashPnl ?? 0) < 0);
+
+    // Use initialValue (cost basis) instead of currentValue (which is 0 for settled markets)
+    const avgPositionSize = positions.length > 0
+      ? positions.reduce((sum, p) => sum + (p.initialValue ?? (p.size * p.avgPrice)), 0) / positions.length
+      : 0;
+
+    const avgWinAmount = winningPositions.length > 0
+      ? winningPositions.reduce((sum, p) => sum + (p.cashPnl ?? 0), 0) / winningPositions.length
+      : 0;
+
+    const avgLossAmount = losingPositions.length > 0
+      ? Math.abs(losingPositions.reduce((sum, p) => sum + (p.cashPnl ?? 0), 0) / losingPositions.length)
+      : 0;
+
+    const uniqueMarkets = new Set(positions.map(p => p.conditionId)).size;
+
+    // Category analysis
+    const categoryStats = this.analyzeCategories(positions);
+
+    // Recent trades
+    const trades = activitySummary.activities.filter(a => a.type === 'TRADE');
+    const recentTrades = trades.slice(0, 10);
+
+    // Build rankings
+    const toRanking = (entry: PeriodLeaderboardEntry | null): PeriodRanking | null => {
+      if (!entry) return null;
+      return { rank: entry.rank, pnl: entry.pnl, volume: entry.volume };
+    };
+
+    return {
+      address,
+      generatedAt: new Date(),
+
+      overview: {
+        totalPnL: profile.totalPnL,
+        realizedPnL: profile.realizedPnL,
+        unrealizedPnL: profile.unrealizedPnL,
+        positionCount: positions.length,
+        tradeCount: profile.tradeCount,
+        smartScore: profile.smartScore,
+        lastActiveAt: profile.lastActiveAt,
+      },
+
+      rankings: {
+        daily: toRanking(dailyPnl),
+        weekly: toRanking(weeklyPnl),
+        monthly: toRanking(monthlyPnl),
+        allTime: toRanking(allTimePnl),
+      },
+
+      performance: {
+        winRate: positions.length > 0 ? (winningPositions.length / positions.length) * 100 : 0,
+        winCount: winningPositions.length,
+        lossCount: losingPositions.length,
+        avgPositionSize,
+        avgWinAmount,
+        avgLossAmount,
+        uniqueMarkets,
+      },
+
+      categoryBreakdown: categoryStats,
+
+      topPositions: positions
+        .sort((a, b) => Math.abs(b.cashPnl ?? 0) - Math.abs(a.cashPnl ?? 0))
+        .slice(0, 10)
+        .map(p => ({
+          market: p.title,
+          slug: p.slug,
+          outcome: p.outcome,
+          size: p.size,
+          avgPrice: p.avgPrice,
+          currentPrice: p.curPrice,
+          pnl: p.cashPnl ?? 0,
+          percentPnl: p.percentPnl,
+        })),
+
+      recentTrades: recentTrades.map(t => ({
+        timestamp: t.timestamp,
+        side: t.side,
+        size: t.size,
+        price: t.price,
+        usdcSize: t.usdcSize,
+        // Include market info for display
+        title: t.title,
+        slug: t.slug,
+        outcome: t.outcome,
+        conditionId: t.conditionId,
+      })),
+
+      activitySummary: {
+        totalBuys: activitySummary.summary.totalBuys,
+        totalSells: activitySummary.summary.totalSells,
+        buyVolume: activitySummary.summary.buyVolume,
+        sellVolume: activitySummary.summary.sellVolume,
+        activeMarketsCount: activitySummary.summary.activeMarkets.length,
+      },
+    };
+  }
+
+  /**
+   * Analyze position categories based on title keywords
+   */
+  private analyzeCategories(positions: Position[]): Array<{ category: string; positionCount: number; totalPnl: number }> {
+    const categoryStats: Record<string, { count: number; totalPnl: number }> = {};
+
+    for (const pos of positions) {
+      const title = (pos.title || '').toLowerCase();
+      let category = 'other';
+
+      if (title.includes('trump') || title.includes('biden') || title.includes('election') || title.includes('president') || title.includes('congress')) {
+        category = 'politics';
+      } else if (title.includes('bitcoin') || title.includes('btc') || title.includes('eth') || title.includes('crypto') || title.includes('solana')) {
+        category = 'crypto';
+      } else if (title.includes('nba') || title.includes('nfl') || title.includes('soccer') || title.includes('football') || title.includes('ufc') || title.includes('mlb')) {
+        category = 'sports';
+      } else if (title.includes('fed') || title.includes('inflation') || title.includes('gdp') || title.includes('interest rate') || title.includes('unemployment')) {
+        category = 'economy';
+      } else if (title.includes('ai') || title.includes('openai') || title.includes('google') || title.includes('apple') || title.includes('tesla')) {
+        category = 'tech';
+      }
+
+      if (!categoryStats[category]) {
+        categoryStats[category] = { count: 0, totalPnl: 0 };
+      }
+      categoryStats[category].count++;
+      categoryStats[category].totalPnl += (pos.cashPnl ?? 0);
+    }
+
+    return Object.entries(categoryStats)
+      .map(([category, stats]) => ({
+        category,
+        positionCount: stats.count,
+        totalPnl: stats.totalPnl,
+      }))
+      .sort((a, b) => b.positionCount - a.positionCount);
+  }
+
+  // ============================================================================
+  // Wallet Comparison - 钱包对比
+  // ============================================================================
+
+  /**
+   * Compare multiple wallets
+   *
+   * @example
+   * ```typescript
+   * const comparison = await sdk.smartMoney.compareWallets(
+   *   ['0x111...', '0x222...', '0x333...'],
+   *   { period: 'week' }
+   * );
+   * ```
+   */
+  async compareWallets(
+    addresses: string[],
+    options: { period?: TimePeriod } = {}
+  ): Promise<WalletComparison> {
+    const period = options.period ?? 'week';
+
+    // Fetch data for all wallets in parallel
+    const results = await Promise.all(
+      addresses.map(async (address) => {
+        const [periodPnl, positions] = await Promise.all([
+          this.walletService.getUserPeriodPnl(address, period).catch(() => null),
+          this.walletService.getWalletPositions(address).catch(() => []),
+        ]);
+
+        const winningPositions = positions.filter(p => (p.cashPnl ?? 0) > 0);
+        const winRate = positions.length > 0
+          ? (winningPositions.length / positions.length) * 100
+          : 0;
+
+        return {
+          address,
+          userName: periodPnl?.userName,
+          rank: periodPnl?.rank ?? null,
+          pnl: periodPnl?.pnl ?? 0,
+          volume: periodPnl?.volume ?? 0,
+          positionCount: positions.length,
+          winRate,
+        };
+      })
+    );
+
+    // Sort by PnL descending
+    results.sort((a, b) => b.pnl - a.pnl);
+
+    return {
+      period,
+      generatedAt: new Date(),
+      wallets: results,
     };
   }
 

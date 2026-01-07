@@ -83,4 +83,8 @@ export const CACHE_TTL = {
   LEADERBOARD: 60 * 60 * 1000, // 1 hour
   TICK_SIZE: 24 * 60 * 60 * 1000, // 24 hours
   ACTIVITY: 2 * 60 * 1000, // 2 minutes (wallet activity data)
+  // Binance K-line cache (historical data doesn't change)
+  BINANCE_KLINE: 60 * 1000, // 1 minute
+  // Binance current price cache (more volatile)
+  BINANCE_PRICE: 5 * 1000, // 5 seconds
 };
