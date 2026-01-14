@@ -106,7 +106,56 @@ export interface DipArbServiceConfig {
   autoMerge?: boolean;
 
   /**
+   * Maximum price allowed for Leg1 entry
+   * Prevents buying dips on high-priced assets where risk/reward is poor
+   * e.g., buying a dip from 0.99 to 0.98 risks 0.98 for 0.02 upside
+   * @default 0.75
+   */
+  maxLeg1Price?: number;
+
+  /**
+   * Maximum market asymmetry allowed for trading
+   * When one side exceeds this threshold (e.g., UP > 80%), the market is too resolved
+   * DipArb in asymmetric markets is gambling, not arbitrage - wait for rotation
+   * @default 0.80 (don't trade when either side > 80%)
+   */
+  maxMarketAsymmetry?: number;
+
+  /**
+   * Minimum depth (shares available) on opposite side for Leg1 entry
+   * Prevents entering when opposite side has poor liquidity for Leg2
+   * If opposite side doesn't have enough depth, Leg2 will be expensive/impossible
+   * @default 100 (shares)
+   */
+  minOppositeSideDepth?: number;
+
+  /**
+   * Maximum allowed bid-ask spread on opposite side (as ratio of price)
+   * Calculated as: (secondBestAsk - bestAsk) / bestAsk
+   * Higher spreads mean worse execution for Leg2
+   * @default 0.05 (5%)
+   */
+  maxOppositeSideSpread?: number;
+
+  /**
+   * Minimum price allowed for dip side entry
+   * Prevents buying nearly-resolved tokens (e.g., $0.005) which are lottery tickets
+   * When a token is at $0.005, the market has essentially resolved
+   * @default 0.10 (don't buy tokens under $0.10)
+   */
+  minDipSidePrice?: number;
+
+  /**
+   * Maximum concurrent leg1 positions allowed
+   * Prevents capital lockup in too many pending (unhedged) positions
+   * When this limit is reached, new leg1 signals are skipped
+   * @default 10
+   */
+  maxOpenPositions?: number;
+
+  /**
    * 自动执行交易
+
    * 检测到信号后自动下单
    * @default false
    */
@@ -150,6 +199,64 @@ export interface DipArbServiceConfig {
    * }
    */
   logHandler?: (message: string) => void;
+
+  // ============= Fee Configuration =============
+
+  /**
+   * Taker fee rate for the market
+   * For crypto UP/DOWN markets, this is 3% (0.03)
+   * Fee is applied to both legs, so total overhead is ~6%
+   * @default 0.03
+   */
+  takerFeeRate?: number;
+
+  /**
+   * Use fee-adjusted profit calculations
+   * When true, sumTarget and minProfitRate account for fees
+   * @default true
+   */
+  useFeeAdjustedProfit?: boolean;
+
+  // ============= Binance Momentum Configuration =============
+
+  /**
+   * Paper trading mode - simulate trades without sending real orders
+   * When enabled, orders are simulated at signal prices instead of sent to CLOB
+   * Useful for testing strategies without risking real funds
+   * @default true
+   */
+  paperMode?: boolean;
+
+  /**
+   * Enable Binance momentum check before Leg1 execution
+   * When enabled, validates that external exchange price movement
+   * supports the expected direction before entering a position
+   * @default true
+   */
+  enableBinanceMomentum?: boolean;
+
+  /**
+   * Minimum Binance price change percentage to confirm momentum
+   * A dip signal on Polymarket should correlate with Binance movement
+   * e.g., if DOWN dip detected, Binance should be dropping too
+   * @default 0.5 (0.5% price movement)
+   */
+  binanceMomentumThreshold?: number;
+
+  /**
+   * Time window for Binance momentum check (in ms)
+   * How far back to look for price movement
+   * @default 60000 (1 minute)
+   */
+  binanceMomentumWindowMs?: number;
+
+  /**
+   * Require Binance momentum confirmation for Leg1
+   * If false, momentum check is advisory only (logged but not blocking)
+   * If true, Leg1 execution is blocked without momentum confirmation
+   * @default false
+   */
+  requireBinanceMomentum?: boolean;
 }
 
 /**
@@ -160,25 +267,58 @@ export type DipArbConfigInternal = Required<Omit<DipArbServiceConfig, 'logHandle
 };
 
 /**
+ * Default taker fee for crypto UP/DOWN markets (3%)
+ * This fee applies to EACH leg of the trade, so roundtrip cost is ~6%
+ */
+export const DIP_ARB_CRYPTO_TAKER_FEE = 0.03;
+
+/**
  * 默认配置
+ * 
+ * IMPORTANT: With 3% taker fee per leg (~6% total), you need:
+ * - sumTarget <= 0.90 for 10%+ gross profit to clear ~4%+ net profit
+ * - minProfitRate >= 0.08 to ensure profitability after fees
+ */
+/**
+ * ⚡ OPTIMIZED CONFIG - Updated 2026-01-12 for More Opportunities
+ * - Lower thresholds to catch more dips
+ * - Debug mode enabled for troubleshooting
+ * - Full window monitoring (15 minutes)
  */
 export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
-  shares: 20,
-  sumTarget: 0.92,        // ✅ 放宽到 0.92 提高 Leg2 成交率 (8%+ 利润)
-  dipThreshold: 0.15,
-  windowMinutes: 2,
-  slidingWindowMs: 3000,  // 3秒滑动窗口 - 核心参数！
+  shares: 50,             // ⚡ Increased from 20 for more capital deployment
+  sumTarget: 0.92,        // ⚡ FIXED: ~8% gross = ~2% net after 6% fees (was 1.05 = guaranteed loss!)
+  dipThreshold: 0.01,     // ⚡ LOWERED: 1% dip threshold catches more opportunities
+  windowMinutes: 15,      // ⚡ Full market duration (was 10)
+  slidingWindowMs: 2000,  // ⚡ LOWERED: 2 seconds for faster detection (was 3000)
   maxSlippage: 0.02,
-  minProfitRate: 0.03,
-  leg2TimeoutSeconds: 180,  // ✅ 缩短到 3 分钟，更快退出未对冲仓位
+  minProfitRate: 0.02,    // ⚡ FIXED: Require 2% net profit minimum (was 0 = no check)
+  leg2TimeoutSeconds: 60, // ⚡ LOWERED: 60s timeout for faster rotation
   enableSurge: true,
-  surgeThreshold: 0.15,
+  surgeThreshold: 0.01,   // ⚡ Match dipThreshold (1%)
   autoMerge: true,
-  autoExecute: false,
-  executionCooldown: 3000,
-  splitOrders: 1,         // ✅ 默认不拆分，避免份额误差
-  orderIntervalMs: 500,   // 拆分订单间隔 500ms
-  debug: false,
+  autoExecute: true,      // ✅ MUST be true to actually trade!
+  executionCooldown: 500, // ⚡ FIX #4: Reduced from 2000ms for faster Leg2 execution
+  splitOrders: 1,         // Don't split orders (avoids share errors)
+  orderIntervalMs: 500,
+  debug: true,            // ⚡ ENABLED for troubleshooting (includes rotation logs)
+  // Paper trading - simulate trades without real orders
+  paperMode: true,        // ✅ Default to paper mode - safe testing without real funds
+  // Fee configuration
+  takerFeeRate: DIP_ARB_CRYPTO_TAKER_FEE,
+  useFeeAdjustedProfit: true,
+  // Binance momentum configuration
+  enableBinanceMomentum: false,         // ❌ Disabled by default - causes issues with geofencing/region locks
+  binanceMomentumThreshold: 0.5,        // 0.5% minimum price movement on Binance
+  binanceMomentumWindowMs: 60000,       // 1 minute lookback
+  requireBinanceMomentum: false,        // Advisory by default, not blocking
+  maxLeg1Price: 0.95,                   // ⚡ RAISED: 0.95 - allow nearly all prices
+  maxMarketAsymmetry: 0.75,             // ⚠️ CRITICAL: Don't trade when UP or DOWN > 75%
+  // Spread/depth checks for opposite side (Leg2 viability)
+  minOppositeSideDepth: 100,            // ✅ Require at least 100 shares on opposite side
+  maxOppositeSideSpread: 0.05,          // ✅ Max 5% spread on opposite side
+  minDipSidePrice: 0.03,                // ⚡ LOWERED: 0.03 to include more markets
+  maxOpenPositions: 25,                 // ⚡ INCREASED: 25 concurrent positions (was 10)
 };
 
 // ============= Market Configuration =============
@@ -186,8 +326,57 @@ export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
 /** 支持的底层资产 */
 export type DipArbUnderlying = 'BTC' | 'ETH' | 'SOL' | 'XRP';
 
-/** 市场时长 */
-export type DipArbDuration = 5 | 15;
+/** 市场时长 (分钟) - 5m, 15m, 1hr, 4hr, daily */
+export type DipArbDuration = 5 | 15 | 60 | 240 | 1440;
+
+/** 市场时长字符串格式 */
+export type DipArbDurationString = '5m' | '15m' | '1h' | '4h' | 'daily';
+
+/** Duration priority (lower = higher priority) */
+export const DURATION_PRIORITY: Record<DipArbDurationString, number> = {
+  '5m': 0,
+  '15m': 1,
+  '1h': 2,
+  '4h': 3,
+  'daily': 4,
+};
+
+/** Duration to minutes mapping */
+export const DURATION_MINUTES: Record<DipArbDurationString, DipArbDuration> = {
+  '5m': 5,
+  '15m': 15,
+  '1h': 60,
+  '4h': 240,
+  'daily': 1440,
+};
+
+/** Minutes to duration string mapping */
+export const MINUTES_TO_DURATION: Record<DipArbDuration, DipArbDurationString> = {
+  5: '5m',
+  15: '15m',
+  60: '1h',
+  240: '4h',
+  1440: 'daily',
+};
+
+/** Default fallback chain - priority order for duration fallback */
+export const DURATION_FALLBACK_CHAIN: DipArbDurationString[] = ['15m', '1h', '4h', 'daily'];
+
+/** Coin short name to full name mapping (for hourly/daily slug generation) */
+export const COIN_TO_FULL_NAME: Record<DipArbUnderlying, string> = {
+  BTC: 'bitcoin',
+  ETH: 'ethereum',
+  SOL: 'solana',
+  XRP: 'xrp',
+};
+
+/** Full name to coin short name mapping */
+export const FULL_NAME_TO_COIN: Record<string, DipArbUnderlying> = {
+  bitcoin: 'BTC',
+  ethereum: 'ETH',
+  solana: 'SOL',
+  xrp: 'XRP',
+};
 
 /**
  * 市场配置
@@ -472,7 +661,7 @@ export interface DipArbScanOptions {
   /** 筛选底层资产 */
   coin?: DipArbUnderlying | 'all';
   /** 筛选时长 */
-  duration?: '5m' | '15m' | 'all';
+  duration?: DipArbDurationString | 'all';
   /** 距离结束的最小分钟数 */
   minMinutesUntilEnd?: number;
   /** 距离结束的最大分钟数 */
@@ -488,7 +677,7 @@ export interface DipArbFindAndStartOptions {
   /** 偏好的底层资产 */
   coin?: DipArbUnderlying;
   /** 偏好的时长 */
-  preferDuration?: '5m' | '15m';
+  preferDuration?: DipArbDurationString;
 }
 
 /**
@@ -500,7 +689,7 @@ export interface DipArbAutoRotateConfig {
   /** 监控的底层资产列表 */
   underlyings: DipArbUnderlying[];
   /** 偏好的时长 */
-  duration: '5m' | '15m';
+  duration: DipArbDurationString;
   /** 市场结束前多少分钟开始寻找下一个市场 */
   preloadMinutes?: number;
   /** 市场结束后自动结算 */
@@ -511,6 +700,28 @@ export interface DipArbAutoRotateConfig {
   redeemWaitMinutes?: number;
   /** Redeem 重试间隔（秒）- 每次检查 resolution 的间隔，默认 30 秒 */
   redeemRetryIntervalSeconds?: number;
+  /**
+   * Enable duration fallback when preferred duration unavailable
+   * @default true
+   */
+  enableFallback?: boolean;
+  /**
+   * Duration priority order for fallback (first available wins)
+   * @default ['15m', '1h', '4h', 'daily']
+   */
+  durationPriority?: DipArbDurationString[];
+  /**
+   * Polling interval for checking higher-priority markets (ms)
+   * Only used when trading at a fallback duration
+   * @default 60000 (1 minute)
+   */
+  upgradeCheckIntervalMs?: number;
+  /**
+   * Whether to immediately switch to higher-priority market when available
+   * or wait for current market to end
+   * @default false (wait for current market)
+   */
+  immediateUpgrade?: boolean;
 }
 
 /**
@@ -518,13 +729,17 @@ export interface DipArbAutoRotateConfig {
  */
 export const DEFAULT_AUTO_ROTATE_CONFIG: Required<DipArbAutoRotateConfig> = {
   enabled: false,
-  underlyings: ['BTC'],
+  underlyings: ['BTC', 'ETH', 'SOL', 'XRP'],
   duration: '15m',
   preloadMinutes: 2,
   autoSettle: true,
   settleStrategy: 'redeem',
   redeemWaitMinutes: 5,
   redeemRetryIntervalSeconds: 30,
+  enableFallback: true,
+  durationPriority: ['15m', '1h', '4h', 'daily'],
+  upgradeCheckIntervalMs: 60000,
+  immediateUpgrade: false,
 };
 
 /**
@@ -579,7 +794,7 @@ export interface DipArbRotateEvent {
   /** 新市场 condition ID */
   newMarket: string;
   /** 轮换原因 */
-  reason: 'marketEnded' | 'manual' | 'error';
+  reason: 'marketEnded' | 'manual' | 'error' | 'upgrade';
   /** 时间戳 */
   timestamp: number;
   /** 结算结果（如果有） */
@@ -611,18 +826,39 @@ export function createDipArbInitialStats(): DipArbStats {
 /**
  * 创建新轮次状态
  */
+/**
+ * Create a new DipArb round state
+ *
+ * @param roundId - Unique round identifier
+ * @param priceToBeat - Chainlink price at round start (for UP/DOWN resolution)
+ * @param upPrice - Current UP token price
+ * @param downPrice - Current DOWN token price
+ * @param marketEndTime - ACTUAL market end time from Polymarket (use this!)
+ * @param durationMinutes - Fallback duration if marketEndTime not provided (legacy)
+ */
 export function createDipArbRoundState(
   roundId: string,
   priceToBeat: number,
   upPrice: number,
   downPrice: number,
+  marketEndTime?: number | Date,
   durationMinutes: number = 15
 ): DipArbRoundState {
   const now = Date.now();
+
+  // Use actual market end time if provided, otherwise calculate from duration
+  let endTime: number;
+  if (marketEndTime) {
+    endTime = typeof marketEndTime === 'number' ? marketEndTime : marketEndTime.getTime();
+  } else {
+    // Fallback: calculate from duration (legacy behavior - not accurate!)
+    endTime = now + durationMinutes * 60 * 1000;
+  }
+
   return {
     roundId,
     startTime: now,
-    endTime: now + durationMinutes * 60 * 1000,
+    endTime,
     priceToBeat,
     openPrices: {
       up: upPrice,
@@ -633,11 +869,74 @@ export function createDipArbRoundState(
 }
 
 /**
- * 计算利润率
+ * 计算利润率 (GROSS - before fees)
+ * @deprecated Use calculateDipArbNetProfitRate for fee-adjusted calculations
  */
 export function calculateDipArbProfitRate(totalCost: number): number {
   if (totalCost >= 1 || totalCost <= 0) return 0;
   return (1 - totalCost) / totalCost;
+}
+
+/**
+ * Calculate NET profit rate after trading fees
+ * 
+ * For DipArb with 3% taker fee per leg:
+ * - Gross profit = 1 - totalCost
+ * - Fee overhead = totalCost * feeRate * 2 (fees on both legs)
+ * - Net profit = gross profit - fees
+ * 
+ * @param totalCost - Sum of leg1Price + leg2Price
+ * @param feeRate - Taker fee rate (default: 0.03 = 3%)
+ * @returns Net profit rate after fees (can be negative)
+ * 
+ * @example
+ * // Cost = 0.92 (8% gross profit)
+ * // Fees = 0.92 * 0.03 * 2 = 0.0552 (5.52%)
+ * // Net = 0.08 - 0.0552 = 0.0248 (2.48%)
+ * calculateDipArbNetProfitRate(0.92, 0.03) // ~0.0248
+ */
+export function calculateDipArbNetProfitRate(
+  totalCost: number,
+  feeRate: number = DIP_ARB_CRYPTO_TAKER_FEE
+): number {
+  if (totalCost >= 1 || totalCost <= 0) return 0;
+  
+  const grossProfit = 1 - totalCost;
+  const totalFees = totalCost * feeRate * 2; // Fees on both legs
+  const netProfit = grossProfit - totalFees;
+  
+  // Return as a rate relative to effective cost (including fees)
+  const effectiveCost = totalCost + totalFees;
+  return netProfit / effectiveCost;
+}
+
+/**
+ * Calculate the maximum sumTarget that ensures a minimum net profit rate
+ * 
+ * @param minNetProfitRate - Minimum desired net profit (e.g., 0.02 = 2%)
+ * @param feeRate - Taker fee rate (default: 0.03 = 3%)
+ * @returns Maximum sumTarget value
+ * 
+ * @example
+ * // For 2% net profit with 3% fees:
+ * getMaxSumTargetForNetProfit(0.02, 0.03) // ~0.896
+ */
+export function getMaxSumTargetForNetProfit(
+  minNetProfitRate: number,
+  feeRate: number = DIP_ARB_CRYPTO_TAKER_FEE
+): number {
+  // Solve for totalCost where netProfitRate = minNetProfitRate
+  // netProfit = (1 - cost) - cost * feeRate * 2
+  // netProfit = 1 - cost * (1 + 2 * feeRate)
+  // netProfitRate = netProfit / (cost + cost * 2 * feeRate)
+  // netProfitRate = (1 - cost * (1 + 2*f)) / (cost * (1 + 2*f))
+  // Let k = 1 + 2*f
+  // r = (1 - cost*k) / (cost*k)
+  // r * cost * k = 1 - cost*k
+  // cost*k * (r + 1) = 1
+  // cost = 1 / (k * (r + 1))
+  const k = 1 + 2 * feeRate;
+  return 1 / (k * (1 + minNetProfitRate));
 }
 
 /**
@@ -673,25 +972,62 @@ export function detectMispricing(tokenPrice: number, estimatedWinRate: number): 
 
 /**
  * 从 slug 解析底层资产
- * e.g., 'btc-updown-15m-1767165300' → 'BTC'
+ *
+ * Slug patterns:
+ * - Short-term: btc-updown-15m-{timestamp}, eth-updown-4h-{timestamp}
+ * - Hourly: bitcoin-up-or-down-january-13-6pm-et
+ * - Daily: bitcoin-up-or-down-on-january-14
  */
 export function parseUnderlyingFromSlug(slug: string): DipArbUnderlying {
   const lower = slug.toLowerCase();
-  if (lower.startsWith('btc')) return 'BTC';
-  if (lower.startsWith('eth')) return 'ETH';
-  if (lower.startsWith('sol')) return 'SOL';
+
+  // Short-form slugs (btc-, eth-, sol-, xrp-)
+  if (lower.startsWith('btc-')) return 'BTC';
+  if (lower.startsWith('eth-')) return 'ETH';
+  if (lower.startsWith('sol-')) return 'SOL';
+  if (lower.startsWith('xrp-')) return 'XRP';
+
+  // Human-readable slugs (bitcoin-, ethereum-, solana-, xrp-)
+  if (lower.startsWith('bitcoin')) return 'BTC';
+  if (lower.startsWith('ethereum')) return 'ETH';
+  if (lower.startsWith('solana')) return 'SOL';
   if (lower.startsWith('xrp')) return 'XRP';
+
   return 'BTC'; // default
 }
 
 /**
  * 从 slug 解析时长
- * e.g., 'btc-updown-15m-1767165300' → 15
+ *
+ * Slug patterns:
+ * - 5m/15m: btc-updown-{5m|15m}-{timestamp}
+ * - 4h: btc-updown-4h-{timestamp}
+ * - Hourly: bitcoin-up-or-down-january-13-6pm-et
+ * - Daily: bitcoin-up-or-down-on-january-14
  */
 export function parseDurationFromSlug(slug: string): DipArbDuration {
-  if (slug.includes('-5m-')) return 5;
-  if (slug.includes('-15m-')) return 15;
+  const lower = slug.toLowerCase();
+
+  // Epoch-based short-term slugs
+  if (lower.includes('-5m-')) return 5;
+  if (lower.includes('-15m-')) return 15;
+  if (lower.includes('-4h-')) return 240;
+
+  // Human-readable hourly: bitcoin-up-or-down-january-13-6pm-et
+  if (/-up-or-down-\w+-\d+-\d+[ap]m-et$/.test(lower)) return 60;
+
+  // Human-readable daily: bitcoin-up-or-down-on-january-14
+  if (/-up-or-down-on-\w+-\d+$/.test(lower)) return 1440;
+
   return 15; // default
+}
+
+/**
+ * 从 slug 解析时长字符串格式
+ */
+export function parseDurationStringFromSlug(slug: string): DipArbDurationString {
+  const minutes = parseDurationFromSlug(slug);
+  return MINUTES_TO_DURATION[minutes] || '15m';
 }
 
 /**

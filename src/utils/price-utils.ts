@@ -5,7 +5,112 @@
  * - Price validation and rounding to tick size
  * - Size validation
  * - Order amount calculation
+ * - Fee-adjusted profit calculations
  */
+
+// ============= Polymarket Fee Constants =============
+
+/**
+ * Polymarket taker fee for crypto short-term markets (BTC/ETH/SOL/XRP UP/DOWN)
+ * As of 2025, these markets have a 3% taker fee
+ */
+export const POLY_CRYPTO_TAKER_FEE = 0.03;
+
+/**
+ * Polymarket taker fee for standard markets (politics, sports, etc.)
+ * Most standard markets have 0% taker fee
+ */
+export const POLY_STANDARD_TAKER_FEE = 0;
+
+/**
+ * Market type for fee calculation
+ * - 'crypto': BTC/ETH/SOL/XRP UP/DOWN short-term markets (3% taker fee)
+ * - 'standard': General markets (0% taker fee)
+ * - 'sports': Sports betting markets (0% taker fee, same as standard)
+ */
+export type MarketFeeType = 'crypto' | 'standard' | 'sports';
+
+/**
+ * Get the taker fee rate for a market type
+ * @param marketType - 'crypto' for short-term crypto markets, 'standard'/'sports' for others
+ * @returns Fee rate (0.03 = 3%)
+ */
+export function getTakerFeeRate(marketType: MarketFeeType): number {
+  return marketType === 'crypto' ? POLY_CRYPTO_TAKER_FEE : POLY_STANDARD_TAKER_FEE;
+}
+
+/**
+ * Calculate fee-adjusted profit for arbitrage
+ * 
+ * For long arb (buy YES + NO, merge for $1):
+ * - Total cost = cost + (cost * feeRate * 2) for fees on both legs
+ * - Profit = 1 - effectiveCost
+ * 
+ * @param totalCost - Raw cost of buying YES + NO
+ * @param feeRate - Taker fee rate (default: POLY_CRYPTO_TAKER_FEE)
+ * @returns Fee-adjusted profit (can be negative if fees exceed profit)
+ * 
+ * @example
+ * // If YES = 0.48, NO = 0.49, totalCost = 0.97
+ * // With 3% fees: effectiveCost = 0.97 * 1.06 = 1.0282
+ * // Fee-adjusted profit = 1 - 1.0282 = -0.0282 (LOSS)
+ * calculateFeeAdjustedProfit(0.97, 0.03) // Returns -0.0282
+ */
+export function calculateFeeAdjustedProfit(
+  totalCost: number,
+  feeRate: number = POLY_CRYPTO_TAKER_FEE
+): number {
+  if (totalCost <= 0 || totalCost >= 1) return 0;
+  
+  // Fees apply to both legs (buy YES and buy NO)
+  const effectiveCost = totalCost * (1 + feeRate * 2);
+  return 1 - effectiveCost;
+}
+
+/**
+ * Calculate fee-adjusted profit rate (as percentage of cost)
+ * 
+ * @param totalCost - Raw cost of buying YES + NO
+ * @param feeRate - Taker fee rate (default: POLY_CRYPTO_TAKER_FEE)
+ * @returns Fee-adjusted profit rate (e.g., 0.05 = 5% profit)
+ * 
+ * @example
+ * // If cost = 0.90 (10% gross profit), with 3% fees on both legs:
+ * // effectiveCost = 0.90 * 1.06 = 0.954
+ * // profit = 1 - 0.954 = 0.046 (4.6%)
+ * // profitRate = 0.046 / 0.954 = 4.8%
+ */
+export function calculateFeeAdjustedProfitRate(
+  totalCost: number,
+  feeRate: number = POLY_CRYPTO_TAKER_FEE
+): number {
+  if (totalCost <= 0 || totalCost >= 1) return 0;
+  
+  const effectiveCost = totalCost * (1 + feeRate * 2);
+  if (effectiveCost >= 1) return -(effectiveCost - 1) / effectiveCost; // Return negative rate for losses
+  
+  return (1 - effectiveCost) / effectiveCost;
+}
+
+/**
+ * Calculate minimum required gross profit to break even after fees
+ * 
+ * @param feeRate - Taker fee rate (default: POLY_CRYPTO_TAKER_FEE)
+ * @returns Minimum gross profit rate needed (e.g., 0.06 = 6%)
+ * 
+ * @example
+ * // With 3% fees on both legs, you need at least 6% gross profit to break even
+ * getMinGrossProfitForBreakeven(0.03) // Returns ~0.0638
+ */
+export function getMinGrossProfitForBreakeven(
+  feeRate: number = POLY_CRYPTO_TAKER_FEE
+): number {
+  // For break-even: totalCost * (1 + feeRate * 2) = 1
+  // totalCost = 1 / (1 + feeRate * 2)
+  // grossProfit = 1 - totalCost
+  const breakEvenCost = 1 / (1 + feeRate * 2);
+  return 1 - breakEvenCost;
+}
 
 // Tick size types (as defined by Polymarket)
 export type TickSize = '0.1' | '0.01' | '0.001' | '0.0001';
@@ -213,6 +318,29 @@ export function getEffectivePrices(
 }
 
 /**
+ * Arbitrage opportunity result
+ */
+export interface ArbitrageOpportunityResult {
+  type: 'long' | 'short';
+  /** Gross profit (before fees) */
+  grossProfit: number;
+  /** Net profit (after fees) - can be negative */
+  netProfit: number;
+  /** Gross profit rate (before fees) */
+  grossProfitRate: number;
+  /** Net profit rate (after fees) - can be negative */
+  netProfitRate: number;
+  /** Fee rate applied */
+  feeRate: number;
+  /** Total fees paid (on both legs) */
+  totalFees: number;
+  /** Description */
+  description: string;
+  /** Whether this is profitable after fees */
+  isProfitable: boolean;
+}
+
+/**
  * Check if there's an arbitrage opportunity
  *
  * 使用有效价格计算套利机会（正确考虑镜像订单）
@@ -226,7 +354,8 @@ export function getEffectivePrices(
  * @param noAsk - Lowest ask for NO token
  * @param yesBid - Highest bid for YES token
  * @param noBid - Highest bid for NO token
- * @returns Arbitrage info or null
+ * @returns Arbitrage info or null (legacy - gross profit only)
+ * @deprecated Use checkArbitrageWithFees for fee-aware calculations
  */
 export function checkArbitrage(
   yesAsk: number,
@@ -259,6 +388,97 @@ export function checkArbitrage(
       profit: shortProfit,
       description: `Split $1, Sell YES @ ${effective.effectiveSellYes.toFixed(4)} + NO @ ${effective.effectiveSellNo.toFixed(4)}`,
     };
+  }
+
+  return null;
+}
+
+/**
+ * Check if there's an arbitrage opportunity with fee-aware calculations
+ *
+ * This is the recommended function for determining real profitability.
+ * It accounts for Polymarket taker fees on both legs of the trade.
+ *
+ * For crypto markets (BTC/ETH/SOL/XRP UP/DOWN): 3% taker fee per leg = 6% total
+ * For standard markets: 0% taker fee
+ *
+ * @param yesAsk - Lowest ask for YES token
+ * @param noAsk - Lowest ask for NO token
+ * @param yesBid - Highest bid for YES token
+ * @param noBid - Highest bid for NO token
+ * @param feeRate - Taker fee rate (default: POLY_CRYPTO_TAKER_FEE = 0.03)
+ * @param minNetProfit - Minimum net profit required (default: 0)
+ * @returns Arbitrage opportunity with fee details, or null if unprofitable
+ *
+ * @example
+ * // Crypto market with 3% fees
+ * const opp = checkArbitrageWithFees(0.48, 0.49, 0.47, 0.48, 0.03, 0.02);
+ * // opp.grossProfit = 0.03 (3%)
+ * // opp.netProfit = -0.0282 (LOSS after 6% fees)
+ * // opp.isProfitable = false
+ */
+export function checkArbitrageWithFees(
+  yesAsk: number,
+  noAsk: number,
+  yesBid: number,
+  noBid: number,
+  feeRate: number = POLY_CRYPTO_TAKER_FEE,
+  minNetProfit: number = 0
+): ArbitrageOpportunityResult | null {
+  const effective = getEffectivePrices(yesAsk, yesBid, noAsk, noBid);
+
+  // Long arbitrage: Buy complete set (YES + NO) cheaper than $1
+  const effectiveLongCost = effective.effectiveBuyYes + effective.effectiveBuyNo;
+  const longGrossProfit = 1 - effectiveLongCost;
+
+  if (longGrossProfit > 0) {
+    // Calculate fees on the purchase amount
+    const totalFees = effectiveLongCost * feeRate * 2;
+    const netProfit = longGrossProfit - totalFees;
+    const grossProfitRate = longGrossProfit / effectiveLongCost;
+    const netProfitRate = netProfit > 0 ? netProfit / (effectiveLongCost + totalFees) : netProfit / effectiveLongCost;
+    const isProfitable = netProfit >= minNetProfit;
+
+    if (isProfitable || netProfit > 0) {
+      return {
+        type: 'long',
+        grossProfit: longGrossProfit,
+        netProfit,
+        grossProfitRate,
+        netProfitRate,
+        feeRate,
+        totalFees,
+        description: `Buy YES @ ${effective.effectiveBuyYes.toFixed(4)} + NO @ ${effective.effectiveBuyNo.toFixed(4)}, Merge for $1 (net: ${(netProfitRate * 100).toFixed(2)}%)`,
+        isProfitable,
+      };
+    }
+  }
+
+  // Short arbitrage: Sell complete set (YES + NO) for more than $1
+  const effectiveShortRevenue = effective.effectiveSellYes + effective.effectiveSellNo;
+  const shortGrossProfit = effectiveShortRevenue - 1;
+
+  if (shortGrossProfit > 0) {
+    // Calculate fees on the sale amount
+    const totalFees = effectiveShortRevenue * feeRate * 2;
+    const netProfit = shortGrossProfit - totalFees;
+    const grossProfitRate = shortGrossProfit; // Already a rate since revenue is compared to $1
+    const netProfitRate = netProfit;
+    const isProfitable = netProfit >= minNetProfit;
+
+    if (isProfitable || netProfit > 0) {
+      return {
+        type: 'short',
+        grossProfit: shortGrossProfit,
+        netProfit,
+        grossProfitRate,
+        netProfitRate,
+        feeRate,
+        totalFees,
+        description: `Split $1, Sell YES @ ${effective.effectiveSellYes.toFixed(4)} + NO @ ${effective.effectiveSellNo.toFixed(4)} (net: ${(netProfitRate * 100).toFixed(2)}%)`,
+        isProfitable,
+      };
+    }
   }
 
   return null;

@@ -128,7 +128,13 @@ export type {
 // RealtimeService (legacy) has been removed - use RealtimeServiceV2 instead
 
 // ArbitrageService (Real-time arbitrage detection, execution, rebalancing, and settlement)
-export { ArbitrageService } from './services/arbitrage-service.js';
+export {
+  ArbitrageService,
+  // Preset configurations for different market types
+  SPORTS_ARB_CONFIG,
+  CRYPTO_ARB_CONFIG,
+  createSportsMarketConfig,
+} from './services/arbitrage-service.js';
 export type {
   ArbitrageMarketConfig,
   ArbitrageServiceConfig,
@@ -149,6 +155,16 @@ export type {
   ScanCriteria,
   ScanResult,
 } from './services/arbitrage-service.js';
+
+// NegRiskArbService - Multi-outcome arbitrage for championships/tournaments
+export { NegRiskArbService, calculateNegRiskArbitrage } from './services/negrisk-arb-service.js';
+export type {
+  NegRiskArbServiceConfig,
+  NegRiskOutcome,
+  NegRiskEvent,
+  NegRiskExecutionResult,
+  NegRiskArbServiceEvents,
+} from './services/negrisk-arb-service.js';
 
 // SmartMoneyService - Smart Money detection and Copy Trading
 export {
@@ -220,7 +236,32 @@ export type {
   DipArbUnderlying,
   DipArbPhase,
   DipArbLegInfo,
+  // Duration fallback types
+  DipArbDurationString,
+  DURATION_PRIORITY,
+  DURATION_FALLBACK_CHAIN,
+  COIN_TO_FULL_NAME,
 } from './services/dip-arb-types.js';
+
+// SportsMarketScanner - Sports market discovery and arbitrage scanning
+export { SportsMarketScanner, getSupportedLeagues, getLeagueKeywords } from './services/sports-scanner.js';
+export type {
+  SportsLeague,
+  SportsMarketType,
+  SportMarket,
+  NegRiskSportsEvent,
+  SportsScanOptions,
+  SportsScanResult,
+} from './services/sports-scanner.js';
+
+// SportsArbOrchestrator - Unified sports arbitrage coordination
+export { SportsArbOrchestrator } from './services/sports-arb-orchestrator.js';
+export type {
+  SportsArbOrchestratorConfig,
+  SportsArbOpportunity,
+  OrchestratorStatus,
+  SportsArbOrchestratorEvents,
+} from './services/sports-arb-orchestrator.js';
 
 // BinanceService - BTC/ETH/SOL K-line data from Binance
 export { BinanceService } from './services/binance-service.js';
@@ -451,13 +492,16 @@ export class PolymarketSDK {
       this.dataApi  // pass dataApi for report generation
     );
 
-    // Initialize DipArbService
+    // Initialize DipArbService with BinanceService for momentum detection
+    // This enables the key edge from the strategy: "entering after confirmed momentum 
+    // on external exchanges like Binance while Polymarket lags"
     this.dipArb = new DipArbService(
       this.realtime,
       this.tradingService,
       this.markets,
       config.privateKey,
-      config.chainId
+      config.chainId,
+      this.binance // Inject BinanceService for momentum validation
     );
   }
 

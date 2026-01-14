@@ -31,7 +31,14 @@ import { CTFClient, type TokenIds } from '../clients/ctf-client.js';
 import { GammaApiClient } from '../clients/gamma-api.js';
 import { RateLimiter } from '../core/rate-limiter.js';
 import { createUnifiedCache } from '../core/unified-cache.js';
-import { getEffectivePrices } from '../utils/price-utils.js';
+import {
+  getEffectivePrices,
+  calculateFeeAdjustedProfit,
+  calculateFeeAdjustedProfitRate,
+  POLY_CRYPTO_TAKER_FEE,
+  POLY_STANDARD_TAKER_FEE,
+  type MarketFeeType,
+} from '../utils/price-utils.js';
 import type { BookUpdate } from '../core/types.js';
 
 // ===== Types =====
@@ -54,7 +61,7 @@ export interface ArbitrageServiceConfig {
   privateKey?: string;
   /** RPC URL for CTF operations */
   rpcUrl?: string;
-  /** Minimum profit threshold (default: 0.005 = 0.5%) */
+  /** Minimum profit threshold (default: 0.005 = 0.5%) - NOTE: This is NET profit after fees */
   profitThreshold?: number;
   /** Minimum trade size in USDC (default: 5) */
   minTradeSize?: number;
@@ -68,6 +75,27 @@ export interface ArbitrageServiceConfig {
   enableLogging?: boolean;
   /** Cooldown between executions in ms (default: 5000) */
   executionCooldown?: number;
+
+  // ===== Fee Configuration =====
+  /**
+   * Market type for fee calculation
+   * - 'crypto': BTC/ETH/SOL/XRP UP/DOWN markets with 3% taker fee
+   * - 'standard': Regular markets with 0% taker fee
+   * - 'sports': Sports betting markets with 0% taker fee
+   * @default 'crypto'
+   */
+  marketType?: MarketFeeType;
+  /**
+   * Custom taker fee rate (overrides marketType if set)
+   * e.g., 0.03 = 3% taker fee per leg
+   */
+  takerFeeRate?: number;
+  /**
+   * Use fee-adjusted profit calculations (default: true)
+   * When true, profitThreshold is compared against NET profit after fees
+   * When false, profitThreshold is compared against GROSS profit (legacy behavior)
+   */
+  useFeeAdjustedProfit?: boolean;
 
   // ===== Rebalancer Config =====
   /** Enable auto-rebalancing (default: false) */
@@ -253,10 +281,11 @@ export class ArbitrageService extends EventEmitter {
   private rateLimiter: RateLimiter;
 
   private market: ArbitrageMarketConfig | null = null;
-  private config: Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval'> & {
+  private config: Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval' | 'takerFeeRate'> & {
     privateKey?: string;
     rpcUrl?: string;
     rebalanceIntervalMs: number;
+    takerFeeRate: number; // Computed from marketType or explicit config
   };
 
   private orderbook: OrderbookState = {
@@ -294,6 +323,11 @@ export class ArbitrageService extends EventEmitter {
   constructor(config: ArbitrageServiceConfig = {}) {
     super();
 
+    // Determine taker fee rate: explicit > marketType > default (crypto)
+    const marketType = config.marketType ?? 'crypto';
+    const takerFeeRate = config.takerFeeRate ?? 
+      (marketType === 'crypto' ? POLY_CRYPTO_TAKER_FEE : POLY_STANDARD_TAKER_FEE);
+
     this.config = {
       privateKey: config.privateKey,
       rpcUrl: config.rpcUrl || 'https://polygon-rpc.com',
@@ -304,6 +338,10 @@ export class ArbitrageService extends EventEmitter {
       autoExecute: config.autoExecute ?? false,
       enableLogging: config.enableLogging ?? true,
       executionCooldown: config.executionCooldown ?? 5000,
+      // Fee config
+      marketType,
+      takerFeeRate,
+      useFeeAdjustedProfit: config.useFeeAdjustedProfit ?? true,
       // Rebalancer config
       enableRebalancer: config.enableRebalancer ?? false,
       minUsdcRatio: config.minUsdcRatio ?? 0.2,
@@ -467,6 +505,9 @@ export class ArbitrageService extends EventEmitter {
 
   /**
    * Check for arbitrage opportunity based on current orderbook
+   * 
+   * Uses fee-adjusted profit calculations when useFeeAdjustedProfit is true (default).
+   * For crypto markets with 3% taker fee, this means ~6% overhead per roundtrip.
    */
   checkOpportunity(): ArbitrageOpportunity | null {
     if (!this.market) return null;
@@ -484,11 +525,29 @@ export class ArbitrageService extends EventEmitter {
     // Calculate effective prices
     const effective = getEffectivePrices(yesBestAsk, yesBestBid, noBestAsk, noBestBid);
 
-    // Check for arbitrage
+    // Check for arbitrage with fee-adjusted calculations
     const longCost = effective.effectiveBuyYes + effective.effectiveBuyNo;
-    const longProfit = 1 - longCost;
     const shortRevenue = effective.effectiveSellYes + effective.effectiveSellNo;
-    const shortProfit = shortRevenue - 1;
+    
+    // Calculate gross profits
+    const longGrossProfit = 1 - longCost;
+    const shortGrossProfit = shortRevenue - 1;
+    
+    // Calculate fee-adjusted (net) profits
+    const feeRate = this.config.takerFeeRate;
+    const longNetProfit = this.config.useFeeAdjustedProfit
+      ? calculateFeeAdjustedProfit(longCost, feeRate)
+      : longGrossProfit;
+    const longNetProfitRate = this.config.useFeeAdjustedProfit
+      ? calculateFeeAdjustedProfitRate(longCost, feeRate)
+      : (longGrossProfit / longCost);
+    
+    // Short arb fees are on the revenue side
+    const shortFees = shortRevenue * feeRate * 2;
+    const shortNetProfit = this.config.useFeeAdjustedProfit
+      ? shortGrossProfit - shortFees
+      : shortGrossProfit;
+    const shortNetProfitRate = shortNetProfit; // Already a rate since compared to $1
 
     // Calculate sizes with safety factor to prevent partial fills
     // Use min of both sides * safety factor to ensure both orders can fill
@@ -498,14 +557,15 @@ export class ArbitrageService extends EventEmitter {
     const heldPairs = Math.min(this.balance.yesTokens, this.balance.noTokens);
     const balanceLongSize = longCost > 0 ? this.balance.usdc / longCost : 0;
 
-    // Check long arb
-    if (longProfit > this.config.profitThreshold) {
+    // Check long arb - compare NET profit to threshold
+    if (longNetProfit > this.config.profitThreshold) {
       const maxSize = Math.min(orderbookLongSize, balanceLongSize * safetyFactor, this.config.maxTradeSize);
       if (maxSize >= this.config.minTradeSize) {
+        const totalFees = longCost * feeRate * 2 * maxSize;
         return {
           type: 'long',
-          profitRate: longProfit,
-          profitPercent: longProfit * 100,
+          profitRate: longNetProfitRate,
+          profitPercent: longNetProfitRate * 100,
           effectivePrices: {
             buyYes: effective.effectiveBuyYes,
             buyNo: effective.effectiveBuyNo,
@@ -515,21 +575,22 @@ export class ArbitrageService extends EventEmitter {
           maxOrderbookSize: orderbookLongSize,
           maxBalanceSize: balanceLongSize,
           recommendedSize: maxSize,
-          estimatedProfit: longProfit * maxSize,
-          description: `Buy YES @ ${effective.effectiveBuyYes.toFixed(4)} + NO @ ${effective.effectiveBuyNo.toFixed(4)}, Merge for $1`,
+          estimatedProfit: longNetProfit * maxSize,
+          description: `Buy YES @ ${effective.effectiveBuyYes.toFixed(4)} + NO @ ${effective.effectiveBuyNo.toFixed(4)}, Merge for $1 (gross: ${(longGrossProfit * 100).toFixed(2)}%, fees: ${(totalFees / maxSize * 100).toFixed(2)}%, net: ${(longNetProfitRate * 100).toFixed(2)}%)`,
           timestamp: Date.now(),
         };
       }
     }
 
-    // Check short arb
-    if (shortProfit > this.config.profitThreshold) {
+    // Check short arb - compare NET profit to threshold
+    if (shortNetProfit > this.config.profitThreshold) {
       const maxSize = Math.min(orderbookShortSize, heldPairs, this.config.maxTradeSize);
       if (maxSize >= this.config.minTradeSize && heldPairs >= this.config.minTokenReserve) {
+        const totalFees = shortRevenue * feeRate * 2 * maxSize;
         return {
           type: 'short',
-          profitRate: shortProfit,
-          profitPercent: shortProfit * 100,
+          profitRate: shortNetProfitRate,
+          profitPercent: shortNetProfitRate * 100,
           effectivePrices: {
             buyYes: effective.effectiveBuyYes,
             buyNo: effective.effectiveBuyNo,
@@ -539,8 +600,8 @@ export class ArbitrageService extends EventEmitter {
           maxOrderbookSize: orderbookShortSize,
           maxBalanceSize: heldPairs,
           recommendedSize: maxSize,
-          estimatedProfit: shortProfit * maxSize,
-          description: `Sell YES @ ${effective.effectiveSellYes.toFixed(4)} + NO @ ${effective.effectiveSellNo.toFixed(4)}`,
+          estimatedProfit: shortNetProfit * maxSize,
+          description: `Sell YES @ ${effective.effectiveSellYes.toFixed(4)} + NO @ ${effective.effectiveSellNo.toFixed(4)} (gross: ${(shortGrossProfit * 100).toFixed(2)}%, fees: ${(totalFees / maxSize * 100).toFixed(2)}%, net: ${(shortNetProfitRate * 100).toFixed(2)}%)`,
           timestamp: Date.now(),
         };
       }
@@ -1837,4 +1898,79 @@ export class ArbitrageService extends EventEmitter {
     await this.start(best.market);
     return best;
   }
+}
+
+// ===== Preset Configurations =====
+
+/**
+ * Sports arbitrage configuration preset
+ *
+ * Optimized for sports betting markets:
+ * - 0% taker fee (standard/sports markets)
+ * - Lower profit threshold (0.5%)
+ * - Larger max trade size
+ *
+ * @example
+ * ```typescript
+ * const service = new ArbitrageService({
+ *   privateKey: '0x...',
+ *   ...SPORTS_ARB_CONFIG,
+ * });
+ * ```
+ */
+export const SPORTS_ARB_CONFIG: Partial<ArbitrageServiceConfig> = {
+  marketType: 'sports',
+  profitThreshold: 0.005,      // 0.5% minimum net profit
+  minTradeSize: 10,            // $10 minimum
+  maxTradeSize: 500,           // $500 maximum (sports markets often have higher liquidity)
+  executionCooldown: 3000,     // 3 second cooldown
+  useFeeAdjustedProfit: true,  // Sports has 0% fee, but keep calculation enabled
+  sizeSafetyFactor: 0.9,       // 90% of orderbook depth (less slippage risk)
+};
+
+/**
+ * Crypto short-term arbitrage configuration preset
+ *
+ * Optimized for BTC/ETH/SOL/XRP UP/DOWN 5m/15m markets:
+ * - 3% taker fee per leg
+ * - Higher profit threshold (to cover fees)
+ * - Smaller max trade size
+ *
+ * @example
+ * ```typescript
+ * const service = new ArbitrageService({
+ *   privateKey: '0x...',
+ *   ...CRYPTO_ARB_CONFIG,
+ * });
+ * ```
+ */
+export const CRYPTO_ARB_CONFIG: Partial<ArbitrageServiceConfig> = {
+  marketType: 'crypto',
+  profitThreshold: 0.02,       // 2% minimum net profit (after ~6% fees)
+  minTradeSize: 5,             // $5 minimum
+  maxTradeSize: 100,           // $100 maximum (lower liquidity)
+  executionCooldown: 5000,     // 5 second cooldown
+  useFeeAdjustedProfit: true,  // Required for crypto fee calculations
+  sizeSafetyFactor: 0.8,       // 80% of orderbook depth (higher slippage risk)
+};
+
+/**
+ * Create a sports arbitrage market config from scanner result
+ *
+ * @param market - Parsed sport market from SportsMarketScanner
+ * @returns ArbitrageMarketConfig ready for ArbitrageService.start()
+ */
+export function createSportsMarketConfig(
+  market: {
+    raw: { conditionId: string; question: string; slug: string; outcomes?: string[] };
+  },
+  tokens: { yesTokenId: string; noTokenId: string }
+): ArbitrageMarketConfig {
+  return {
+    name: market.raw.question.slice(0, 60) + (market.raw.question.length > 60 ? '...' : ''),
+    conditionId: market.raw.conditionId,
+    yesTokenId: tokens.yesTokenId,
+    noTokenId: tokens.noTokenId,
+    outcomes: (market.raw.outcomes?.slice(0, 2) as [string, string]) || ['Yes', 'No'],
+  };
 }

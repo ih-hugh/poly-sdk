@@ -1337,6 +1337,207 @@ export class MarketService {
     return filteredMarkets.slice(0, limit);
   }
 
+  // ===== Slug Generation Helpers for Longer Duration Markets =====
+
+  /**
+   * Generate slug for 4-hour market
+   * Pattern: {coin}-updown-4h-{timestamp}
+   * e.g., btc-updown-4h-1768338000
+   */
+  private generate4hSlug(coin: string, timestamp: number): string {
+    return `${coin.toLowerCase()}-updown-4h-${timestamp}`;
+  }
+
+  /**
+   * Generate slug for hourly market
+   * Pattern: {fullcoin}-up-or-down-{month}-{day}-{hour}{ampm}-et
+   * e.g., bitcoin-up-or-down-january-13-6pm-et
+   *
+   * Note: Polymarket uses Eastern Time (ET) for hourly markets
+   */
+  private generateHourlySlug(coin: string, date: Date): string {
+    const coinFullNames: Record<string, string> = {
+      btc: 'bitcoin',
+      eth: 'ethereum',
+      sol: 'solana',
+      xrp: 'xrp',
+    };
+    const fullName = coinFullNames[coin.toLowerCase()] || coin.toLowerCase();
+
+    // Convert to Eastern Time (ET)
+    const etDate = new Date(date.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const month = etDate.toLocaleString('en-US', { month: 'long' }).toLowerCase();
+    const day = etDate.getDate();
+    const hour = etDate.getHours();
+    const hour12 = hour % 12 || 12;
+    const period = hour >= 12 ? 'pm' : 'am';
+
+    return `${fullName}-up-or-down-${month}-${day}-${hour12}${period}-et`;
+  }
+
+  /**
+   * Generate slug for daily market
+   * Pattern: {fullcoin}-up-or-down-on-{month}-{day}
+   * e.g., bitcoin-up-or-down-on-january-14
+   */
+  private generateDailySlug(coin: string, date: Date): string {
+    const coinFullNames: Record<string, string> = {
+      btc: 'bitcoin',
+      eth: 'ethereum',
+      sol: 'solana',
+      xrp: 'xrp',
+    };
+    const fullName = coinFullNames[coin.toLowerCase()] || coin.toLowerCase();
+
+    // Use ET timezone for consistency
+    const etDate = new Date(date.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const month = etDate.toLocaleString('en-US', { month: 'long' }).toLowerCase();
+    const day = etDate.getDate();
+
+    return `${fullName}-up-or-down-on-${month}-${day}`;
+  }
+
+  /**
+   * Scan for crypto markets of any duration (5m, 15m, 1h, 4h, daily)
+   *
+   * This is a more comprehensive version of scanCryptoShortTermMarkets
+   * that supports all duration types with their different slug patterns.
+   *
+   * @param options - Scan options
+   * @param options.duration - Duration: '5m' | '15m' | '1h' | '4h' | 'daily'
+   * @param options.coin - Filter by coin: 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'all'
+   * @param options.minMinutesUntilEnd - Minimum minutes until market ends
+   * @param options.maxMinutesUntilEnd - Maximum minutes until market ends
+   * @param options.limit - Maximum number of markets to return
+   */
+  async scanCryptoMarkets(options?: {
+    duration?: '5m' | '15m' | '1h' | '4h' | 'daily';
+    coin?: 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'all';
+    minMinutesUntilEnd?: number;
+    maxMinutesUntilEnd?: number;
+    limit?: number;
+    sortBy?: 'endDate' | 'volume' | 'liquidity';
+  }): Promise<GammaMarket[]> {
+    if (!this.gammaApi) {
+      throw new PolymarketError(ErrorCode.INVALID_CONFIG, 'GammaApiClient is required for market scanning');
+    }
+
+    const {
+      duration = '15m',
+      coin = 'all',
+      minMinutesUntilEnd = 3,
+      maxMinutesUntilEnd = 120,
+      limit = 20,
+      sortBy = 'endDate',
+    } = options ?? {};
+
+    // Use existing method for short-term markets
+    if (duration === '5m' || duration === '15m') {
+      return this.scanCryptoShortTermMarkets({
+        duration,
+        coin,
+        minMinutesUntilEnd,
+        maxMinutesUntilEnd,
+        limit,
+        sortBy,
+      });
+    }
+
+    const allCoins = ['btc', 'eth', 'sol', 'xrp'] as const;
+    const targetCoins = coin === 'all' ? allCoins : [coin.toLowerCase()];
+
+    const slugsToFetch: string[] = [];
+    const nowMs = Date.now();
+
+    if (duration === '4h') {
+      // 4h markets use epoch-based slugs
+      const intervalSeconds = 4 * 60 * 60; // 4 hours in seconds
+      const nowSeconds = Math.floor(nowMs / 1000);
+      const minSlotStart = Math.floor((nowSeconds + minMinutesUntilEnd * 60 - intervalSeconds) / intervalSeconds) * intervalSeconds;
+      const maxSlotStart = Math.ceil((nowSeconds + maxMinutesUntilEnd * 60) / intervalSeconds) * intervalSeconds;
+
+      for (let slotStart = minSlotStart; slotStart <= maxSlotStart; slotStart += intervalSeconds) {
+        for (const coinName of targetCoins) {
+          slugsToFetch.push(this.generate4hSlug(coinName, slotStart));
+        }
+      }
+    } else if (duration === '1h') {
+      // Hourly markets use human-readable slugs
+      // Generate for next N hours based on time range
+      const maxHours = Math.ceil(maxMinutesUntilEnd / 60) + 1;
+
+      for (let hourOffset = 0; hourOffset < maxHours; hourOffset++) {
+        const targetDate = new Date(nowMs + hourOffset * 60 * 60 * 1000);
+        // Round to hour boundary
+        targetDate.setMinutes(0, 0, 0);
+
+        for (const coinName of targetCoins) {
+          slugsToFetch.push(this.generateHourlySlug(coinName, targetDate));
+        }
+      }
+    } else if (duration === 'daily') {
+      // Daily markets use human-readable slugs
+      // Generate for next N days
+      const maxDays = Math.ceil(maxMinutesUntilEnd / 1440) + 1;
+
+      for (let dayOffset = 0; dayOffset < maxDays; dayOffset++) {
+        const targetDate = new Date(nowMs + dayOffset * 24 * 60 * 60 * 1000);
+
+        for (const coinName of targetCoins) {
+          slugsToFetch.push(this.generateDailySlug(coinName, targetDate));
+        }
+      }
+    }
+
+    // Fetch markets in parallel batches
+    const BATCH_SIZE = 10;
+    const allMarkets: GammaMarket[] = [];
+
+    for (let i = 0; i < slugsToFetch.length; i += BATCH_SIZE) {
+      const batch = slugsToFetch.slice(i, i + BATCH_SIZE);
+      const results = await Promise.all(
+        batch.map(async (slug) => {
+          try {
+            const markets = await this.gammaApi!.getMarkets({ slug, limit: 1 });
+            return markets.length > 0 ? markets[0] : null;
+          } catch {
+            return null;
+          }
+        })
+      );
+
+      for (const market of results) {
+        if (market && market.active && !market.closed) {
+          allMarkets.push(market);
+        }
+      }
+    }
+
+    // Filter by end time range
+    const minEndTime = nowMs + minMinutesUntilEnd * 60 * 1000;
+    const maxEndTime = nowMs + maxMinutesUntilEnd * 60 * 1000;
+
+    const filteredMarkets = allMarkets.filter((market) => {
+      const endTime = market.endDate ? new Date(market.endDate).getTime() : 0;
+      return endTime >= minEndTime && endTime <= maxEndTime;
+    });
+
+    // Sort by preference
+    if (sortBy === 'volume') {
+      filteredMarkets.sort((a, b) => (b.volume24hr ?? 0) - (a.volume24hr ?? 0));
+    } else if (sortBy === 'liquidity') {
+      filteredMarkets.sort((a, b) => (b.liquidity ?? 0) - (a.liquidity ?? 0));
+    } else {
+      filteredMarkets.sort((a, b) => {
+        const aEnd = a.endDate ? new Date(a.endDate).getTime() : Infinity;
+        const bEnd = b.endDate ? new Date(b.endDate).getTime() : Infinity;
+        return aEnd - bEnd;
+      });
+    }
+
+    return filteredMarkets.slice(0, limit);
+  }
+
   // ===== Market Signal Detection =====
 
   /**

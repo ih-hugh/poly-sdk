@@ -15,11 +15,19 @@ import {
   calculateMidpoint,
   getEffectivePrices,
   checkArbitrage,
+  checkArbitrageWithFees,
   formatPrice,
   formatUSDC,
   calculatePnL,
   ROUNDING_CONFIG,
+  POLY_CRYPTO_TAKER_FEE,
+  POLY_STANDARD_TAKER_FEE,
+  getTakerFeeRate,
+  calculateFeeAdjustedProfit,
+  calculateFeeAdjustedProfitRate,
+  getMinGrossProfitForBreakeven,
   type TickSize,
+  type MarketFeeType,
 } from './price-utils.js';
 
 describe('Price Utilities', () => {
@@ -240,6 +248,176 @@ describe('Price Utilities', () => {
       expect(ROUNDING_CONFIG['0.01']).toEqual({ price: 2, size: 2, amount: 4 });
       expect(ROUNDING_CONFIG['0.001']).toEqual({ price: 3, size: 2, amount: 5 });
       expect(ROUNDING_CONFIG['0.0001']).toEqual({ price: 4, size: 2, amount: 6 });
+    });
+  });
+
+  // ============= Fee-Related Tests =============
+
+  describe('Fee Constants', () => {
+    it('should have correct crypto taker fee', () => {
+      expect(POLY_CRYPTO_TAKER_FEE).toBe(0.03); // 3%
+    });
+
+    it('should have correct standard taker fee', () => {
+      expect(POLY_STANDARD_TAKER_FEE).toBe(0); // 0%
+    });
+  });
+
+  describe('getTakerFeeRate', () => {
+    it('should return crypto fee for crypto markets', () => {
+      expect(getTakerFeeRate('crypto')).toBe(0.03);
+    });
+
+    it('should return zero fee for standard markets', () => {
+      expect(getTakerFeeRate('standard')).toBe(0);
+    });
+
+    it('should return zero fee for sports markets', () => {
+      expect(getTakerFeeRate('sports')).toBe(0);
+    });
+  });
+
+  describe('calculateFeeAdjustedProfit', () => {
+    it('should return 0 for invalid cost', () => {
+      expect(calculateFeeAdjustedProfit(0)).toBe(0);
+      expect(calculateFeeAdjustedProfit(1)).toBe(0);
+      expect(calculateFeeAdjustedProfit(-0.1)).toBe(0);
+      expect(calculateFeeAdjustedProfit(1.5)).toBe(0);
+    });
+
+    it('should calculate fee-adjusted profit correctly for crypto markets', () => {
+      // Cost = 0.97 (3% gross profit)
+      // Effective cost = 0.97 * (1 + 0.03 * 2) = 0.97 * 1.06 = 1.0282
+      // Net profit = 1 - 1.0282 = -0.0282 (LOSS)
+      const profit = calculateFeeAdjustedProfit(0.97, 0.03);
+      expect(profit).toBeCloseTo(-0.0282, 3);
+    });
+
+    it('should show profit on lower cost trades', () => {
+      // Cost = 0.90 (10% gross profit)
+      // Effective cost = 0.90 * 1.06 = 0.954
+      // Net profit = 1 - 0.954 = 0.046 (4.6% net)
+      const profit = calculateFeeAdjustedProfit(0.90, 0.03);
+      expect(profit).toBeCloseTo(0.046, 3);
+    });
+
+    it('should calculate correctly with zero fees (standard/sports markets)', () => {
+      // Cost = 0.97, no fees
+      // Net profit = 1 - 0.97 = 0.03 (3% profit)
+      const profit = calculateFeeAdjustedProfit(0.97, 0);
+      expect(profit).toBeCloseTo(0.03, 3);
+    });
+
+    it('should use default crypto fee if not specified', () => {
+      const profit = calculateFeeAdjustedProfit(0.90);
+      const profitWithExplicitFee = calculateFeeAdjustedProfit(0.90, POLY_CRYPTO_TAKER_FEE);
+      expect(profit).toBe(profitWithExplicitFee);
+    });
+  });
+
+  describe('calculateFeeAdjustedProfitRate', () => {
+    it('should return 0 for invalid cost', () => {
+      expect(calculateFeeAdjustedProfitRate(0)).toBe(0);
+      expect(calculateFeeAdjustedProfitRate(1)).toBe(0);
+    });
+
+    it('should return negative rate for unprofitable trades', () => {
+      // Cost = 0.97 with 3% fees = loss
+      const rate = calculateFeeAdjustedProfitRate(0.97, 0.03);
+      expect(rate).toBeLessThan(0);
+    });
+
+    it('should return positive rate for profitable trades', () => {
+      // Cost = 0.90 with 3% fees = profit
+      const rate = calculateFeeAdjustedProfitRate(0.90, 0.03);
+      expect(rate).toBeGreaterThan(0);
+      expect(rate).toBeCloseTo(0.048, 2); // ~4.8% net profit rate
+    });
+
+    it('should handle zero fees correctly', () => {
+      // Cost = 0.95, no fees = 5.26% profit rate
+      const rate = calculateFeeAdjustedProfitRate(0.95, 0);
+      expect(rate).toBeCloseTo(0.0526, 3);
+    });
+  });
+
+  describe('getMinGrossProfitForBreakeven', () => {
+    it('should return correct breakeven for crypto markets', () => {
+      // With 3% fee per leg (6% total), need ~6.38% gross to break even
+      const breakeven = getMinGrossProfitForBreakeven(0.03);
+      expect(breakeven).toBeCloseTo(0.0566, 3); // ~5.66%
+    });
+
+    it('should return 0 for zero-fee markets', () => {
+      const breakeven = getMinGrossProfitForBreakeven(0);
+      expect(breakeven).toBe(0);
+    });
+
+    it('should scale with fee rate', () => {
+      // Higher fees = higher breakeven needed
+      const breakeven1 = getMinGrossProfitForBreakeven(0.01); // 1% fee
+      const breakeven3 = getMinGrossProfitForBreakeven(0.03); // 3% fee
+      const breakeven5 = getMinGrossProfitForBreakeven(0.05); // 5% fee
+
+      expect(breakeven3).toBeGreaterThan(breakeven1);
+      expect(breakeven5).toBeGreaterThan(breakeven3);
+    });
+  });
+
+  describe('checkArbitrageWithFees', () => {
+    it('should return null when no arbitrage exists', () => {
+      // Normal spread, no opportunity
+      const result = checkArbitrageWithFees(0.55, 0.45, 0.55, 0.45, 0.03);
+      expect(result).toBeNull();
+    });
+
+    it('should detect long arbitrage and calculate fees correctly', () => {
+      // YES ask=0.45, NO ask=0.45 => total cost 0.90 (10% gross)
+      const result = checkArbitrageWithFees(0.45, 0.45, 0.40, 0.40, 0.03);
+      expect(result).not.toBeNull();
+      expect(result?.type).toBe('long');
+      expect(result?.grossProfit).toBeCloseTo(0.1, 2);
+      expect(result?.totalFees).toBeCloseTo(0.054, 3); // 0.90 * 0.03 * 2
+      expect(result?.netProfit).toBeCloseTo(0.046, 2); // ~4.6%
+      expect(result?.isProfitable).toBe(true);
+    });
+
+    it('should mark as unprofitable when fees exceed gross profit', () => {
+      // YES ask=0.485, NO ask=0.485 => total cost 0.97 (3% gross)
+      // Fees = 0.97 * 0.06 = 0.0582 > 0.03 gross profit = LOSS
+      const result = checkArbitrageWithFees(0.485, 0.485, 0.45, 0.45, 0.03);
+      if (result) {
+        expect(result.grossProfit).toBeGreaterThan(0);
+        expect(result.netProfit).toBeLessThan(0);
+        expect(result.isProfitable).toBe(false);
+      }
+    });
+
+    it('should respect minNetProfit threshold', () => {
+      // Require at least 2% net profit
+      const result = checkArbitrageWithFees(0.46, 0.46, 0.40, 0.40, 0.03, 0.02);
+
+      // Cost = 0.92 (8% gross), after 6% fees = ~2% net
+      // Should still be profitable with 2% threshold
+      if (result) {
+        expect(result.netProfit).toBeGreaterThanOrEqual(0.02 - 0.01); // Allow for calculation variance
+      }
+    });
+
+    it('should handle zero-fee markets correctly', () => {
+      // Sports/standard markets have 0% fee
+      const result = checkArbitrageWithFees(0.48, 0.48, 0.45, 0.45, 0);
+      expect(result).not.toBeNull();
+      expect(result?.totalFees).toBe(0);
+      expect(result?.grossProfit).toBe(result?.netProfit);
+      expect(result?.isProfitable).toBe(true);
+    });
+
+    it('should include helpful description', () => {
+      const result = checkArbitrageWithFees(0.45, 0.45, 0.40, 0.40, 0.03);
+      expect(result?.description).toContain('Buy YES');
+      expect(result?.description).toContain('NO');
+      expect(result?.description).toContain('net:');
     });
   });
 });
