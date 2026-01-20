@@ -1388,6 +1388,30 @@ export class ArbitrageService extends EventEmitter {
   private async fixImbalanceIfNeeded(): Promise<void> {
     if (!this.config.autoFixImbalance || !this.ctf || !this.tradingService || !this.market) return;
 
+    // Step 1: Cancel any stuck/pending orders for this market before fixing imbalance
+    // This prevents interference from partial fills or stuck orders
+    try {
+      const openOrders = await this.tradingService.getOpenOrders();
+      const marketTokenIds = [this.market.yesTokenId, this.market.noTokenId];
+      const marketOrders = openOrders.filter(order => marketTokenIds.includes(order.tokenId));
+
+      if (marketOrders.length > 0) {
+        this.log(`\n🧹 Found ${marketOrders.length} open order(s) for current market - cancelling before imbalance fix`);
+        const orderIds = marketOrders.map(o => o.id);
+        const cancelResult = await this.tradingService.cancelOrders(orderIds);
+        if (cancelResult.success) {
+          this.log(`   ✅ Cancelled ${marketOrders.length} open order(s)`);
+        } else {
+          this.log(`   ⚠️ Cancel returned false - some orders may not have been cancelled`);
+        }
+        // Wait 1 second for cancellations to process through the CLOB
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    } catch (error: any) {
+      this.log(`   ⚠️ Failed to check/cancel open orders: ${error.message}`);
+      // Continue with imbalance fix even if order cancellation fails
+    }
+
     await this.updateBalance();
     const imbalance = this.balance.yesTokens - this.balance.noTokens;
 
