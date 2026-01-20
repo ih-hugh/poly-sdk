@@ -398,6 +398,12 @@ export interface DipArbMarketConfig {
   durationMinutes: DipArbDuration;
   /** 市场结束时间 */
   endTime: Date;
+  /**
+   * Price to beat (threshold) from Polymarket's groupItemThreshold
+   * This is the starting price that determines UP vs DOWN resolution
+   * e.g., 95000 for BTC at $95,000
+   */
+  priceToBeat?: number;
 }
 
 // ============= Round State =============
@@ -848,16 +854,22 @@ export function createDipArbRoundState(
 
   // Use actual market end time if provided, otherwise calculate from duration
   let endTime: number;
+  let startTime: number;
+
   if (marketEndTime) {
     endTime = typeof marketEndTime === 'number' ? marketEndTime : marketEndTime.getTime();
+    // Calculate startTime from endTime - this is the ACTUAL market window start
+    // Not when we started monitoring (which could be mid-window after rotation)
+    startTime = endTime - (durationMinutes * 60 * 1000);
   } else {
     // Fallback: calculate from duration (legacy behavior - not accurate!)
+    startTime = now;
     endTime = now + durationMinutes * 60 * 1000;
   }
 
   return {
     roundId,
-    startTime: now,
+    startTime,
     endTime,
     priceToBeat,
     openPrices: {

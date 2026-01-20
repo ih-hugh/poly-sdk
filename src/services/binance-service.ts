@@ -46,7 +46,7 @@ export interface BinanceKLine {
 /**
  * Supported Binance trading pairs
  */
-export type BinanceSymbol = 'BTCUSDT' | 'ETHUSDT' | 'SOLUSDT';
+export type BinanceSymbol = 'BTCUSDT' | 'ETHUSDT' | 'SOLUSDT' | 'XRPUSDT';
 
 /**
  * Supported K-line intervals
@@ -85,7 +85,7 @@ const DEFAULT_LIMIT = 500;
 const MAX_LIMIT = 1000;
 
 // Valid symbols
-const VALID_SYMBOLS: Set<BinanceSymbol> = new Set(['BTCUSDT', 'ETHUSDT', 'SOLUSDT']);
+const VALID_SYMBOLS: Set<BinanceSymbol> = new Set(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT']);
 
 // Valid intervals
 const VALID_INTERVALS: Set<BinanceInterval> = new Set([

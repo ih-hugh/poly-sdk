@@ -262,6 +262,14 @@ export class RealtimeServiceV2 extends EventEmitter {
   // Store subscription messages for reconnection
   private subscriptionMessages: Map<string, { subscriptions: Array<{ topic: string; type: string; filters?: string; clob_auth?: ClobApiKeyCreds }> }> = new Map();
 
+  // Queue for subscriptions that arrive before connection is established
+  private pendingSubscriptions: Array<{ subscriptions: Array<{ topic: string; type: string; filters?: string; clob_auth?: ClobApiKeyCreds }> }> = [];
+
+  // Subscription queue for rate limiting (prevents Polymarket from dropping subscriptions)
+  private subscriptionQueue: Array<{ subscriptions: Array<{ topic: string; type: string; filters?: string; clob_auth?: ClobApiKeyCreds }> }> = [];
+  private isProcessingQueue = false;
+  private readonly SUBSCRIPTION_DELAY_MS = 100; // 100ms between subscriptions (per connection)
+
   // Caches
   private priceCache: Map<string, PriceUpdate> = new Map();
   private bookCache: Map<string, OrderbookSnapshot> = new Map();
@@ -311,6 +319,9 @@ export class RealtimeServiceV2 extends EventEmitter {
       this.connected = false;
       this.subscriptions.clear();
       this.subscriptionMessages.clear();  // Clear reconnection list
+      this.pendingSubscriptions = [];      // Clear pending queue
+      this.subscriptionQueue = [];         // Clear rate-limited queue
+      this.isProcessingQueue = false;      // Reset queue processing state
     }
   }
 
@@ -659,8 +670,9 @@ export class RealtimeServiceV2 extends EventEmitter {
   }
 
   /**
-   * Subscribe to Chainlink crypto prices
-   * @param symbols - Array of symbols (e.g., ['ETH/USD', 'BTC/USD'])
+   * Subscribe to Chainlink crypto prices (Polymarket oracle feed)
+   * @param symbols - Array of symbols in lowercase format: ['eth/usd', 'btc/usd', 'sol/usd', 'xrp/usd']
+   * Note: Symbols MUST be lowercase with forward slash (e.g., 'eth/usd' not 'ETH/USD')
    */
   subscribeCryptoChainlinkPrices(symbols: string[], handlers: CryptoPriceHandlers = {}): Subscription {
     const subId = `crypto_chainlink_${++this.subscriptionIdCounter}`;
@@ -901,14 +913,25 @@ export class RealtimeServiceV2 extends EventEmitter {
     this.connected = true;
     this.log('Connected to WebSocket server');
 
-    // Re-subscribe to all active subscriptions on reconnect
+    // Move pending subscriptions to the rate-limited queue
+    if (this.pendingSubscriptions.length > 0) {
+      this.log(`Moving ${this.pendingSubscriptions.length} pending subscriptions to queue`);
+      for (const msg of this.pendingSubscriptions) {
+        this.subscriptionQueue.push(msg);
+      }
+      this.pendingSubscriptions = [];
+    }
+
+    // Re-subscribe to all active subscriptions on reconnect (also rate-limited)
     if (this.subscriptionMessages.size > 0) {
-      this.log(`Re-subscribing to ${this.subscriptionMessages.size} subscriptions...`);
-      for (const [subId, msg] of this.subscriptionMessages) {
-        this.log(`Re-subscribing: ${subId}`);
-        this.client?.subscribe(msg);
+      this.log(`Re-subscribing to ${this.subscriptionMessages.size} subscriptions`);
+      for (const [, msg] of this.subscriptionMessages) {
+        this.subscriptionQueue.push(msg);
       }
     }
+
+    // Start processing the queue with rate limiting
+    this.processSubscriptionQueue();
 
     this.emit('connected');
   }
@@ -1226,9 +1249,45 @@ export class RealtimeServiceV2 extends EventEmitter {
 
   private sendSubscription(msg: { subscriptions: Array<{ topic: string; type: string; filters?: string; clob_auth?: ClobApiKeyCreds }> }): void {
     if (this.client && this.connected) {
-      this.client.subscribe(msg);
+      // Add to queue and start processing (rate-limited)
+      this.subscriptionQueue.push(msg);
+      this.processSubscriptionQueue();
     } else {
-      this.log('Cannot subscribe: not connected');
+      // Queue subscription to be sent when connected
+      this.log('Queueing subscription (not yet connected)');
+      this.pendingSubscriptions.push(msg);
+    }
+  }
+
+  /**
+   * Process subscription queue with rate limiting.
+   * Polymarket's WebSocket drops subscriptions sent too rapidly.
+   */
+  private async processSubscriptionQueue(): Promise<void> {
+    // If already processing, the current processor will pick up new items
+    if (this.isProcessingQueue) {
+      return;
+    }
+
+    this.isProcessingQueue = true;
+
+    try {
+      while (this.subscriptionQueue.length > 0) {
+        const msg = this.subscriptionQueue.shift();
+        if (msg && this.client && this.connected) {
+          this.client.subscribe(msg);
+
+          // Always wait after sending to allow time for more items to be queued
+          await new Promise(resolve => setTimeout(resolve, this.SUBSCRIPTION_DELAY_MS));
+        }
+      }
+    } finally {
+      this.isProcessingQueue = false;
+
+      // Re-check queue in case items were added during the final wait
+      if (this.subscriptionQueue.length > 0) {
+        setImmediate(() => this.processSubscriptionQueue());
+      }
     }
   }
 

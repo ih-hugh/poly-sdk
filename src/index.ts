@@ -243,6 +243,14 @@ export type {
   COIN_TO_FULL_NAME,
 } from './services/dip-arb-types.js';
 
+// DipArbManager - Multi-Market Orchestrator for parallel trading
+export { DipArbManager } from './services/dip-arb-manager.js';
+export type {
+  DipArbManagerConfig,
+  ActiveMarket,
+  MarketStatus,
+} from './services/dip-arb-manager.js';
+
 // SportsMarketScanner - Sports market discovery and arbitrage scanning
 export { SportsMarketScanner, getSupportedLeagues, getLeagueKeywords } from './services/sports-scanner.js';
 export type {
@@ -430,6 +438,7 @@ import { RealtimeServiceV2 } from './services/realtime-service-v2.js';
 import { SmartMoneyService } from './services/smart-money-service.js';
 import { BinanceService } from './services/binance-service.js';
 import { DipArbService } from './services/dip-arb-service.js';
+import { DipArbManager } from './services/dip-arb-manager.js';
 import type { UnifiedMarket, ProcessedOrderbook, ArbitrageOpportunity, KLineInterval, KLineCandle, DualKLineData, PolySDKOptions } from './core/types.js';
 import { createUnifiedCache, type UnifiedCache } from './core/unified-cache.js';
 
@@ -454,6 +463,7 @@ export class PolymarketSDK {
   public readonly smartMoney: SmartMoneyService;
   public readonly binance: BinanceService;
   public readonly dipArb: DipArbService;
+  public readonly dipArbManager: DipArbManager;
 
   // Initialization state
   private _initialized = false;
@@ -493,7 +503,7 @@ export class PolymarketSDK {
     );
 
     // Initialize DipArbService with BinanceService for momentum detection
-    // This enables the key edge from the strategy: "entering after confirmed momentum 
+    // This enables the key edge from the strategy: "entering after confirmed momentum
     // on external exchanges like Binance while Polymarket lags"
     this.dipArb = new DipArbService(
       this.realtime,
@@ -502,6 +512,17 @@ export class PolymarketSDK {
       config.privateKey,
       config.chainId,
       this.binance // Inject BinanceService for momentum validation
+    );
+
+    // Initialize DipArbManager for parallel multi-market trading
+    // Shares the same underlying services as dipArb but can run multiple markets
+    this.dipArbManager = new DipArbManager(
+      this.realtime,
+      this.tradingService,
+      this.markets,
+      config.privateKey,
+      config.chainId,
+      this.binance
     );
   }
 

@@ -186,6 +186,18 @@ export interface GammaMarket {
    * Category tags (e.g., ["crypto", "bitcoin", "finance"])
    */
   tags?: string[];
+
+  /**
+   * Group item threshold - the "price to beat" for UP/DOWN markets
+   * For crypto markets, this is the price at market start (e.g., "95000" for BTC at $95,000)
+   */
+  groupItemThreshold?: string;
+
+  /**
+   * Token IDs for YES/NO or UP/DOWN outcomes
+   * JSON string like '["tokenId1", "tokenId2"]'
+   */
+  clobTokenIds?: string;
 }
 
 /**
@@ -594,6 +606,9 @@ export class GammaApiClient {
       image: m.image ? String(m.image) : undefined,
       icon: m.icon ? String(m.icon) : undefined,
       tags: m.tags ? this.parseJsonArray(m.tags, []) : undefined,
+      // UP/DOWN market specific fields
+      groupItemThreshold: m.groupItemThreshold ? String(m.groupItemThreshold) : undefined,
+      clobTokenIds: m.clobTokenIds ? String(m.clobTokenIds) : undefined,
     };
   }
 

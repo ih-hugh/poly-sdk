@@ -353,8 +353,9 @@ export class TradingService {
    *
    * Note: Polymarket enforces minimum order requirements:
    * - Minimum value: $1 USDC (MIN_ORDER_VALUE_USDC)
+   * - Minimum size: 5 shares (MIN_ORDER_SIZE_SHARES)
    *
-   * Market orders below this limit will be rejected by the API.
+   * Market orders below these limits will be rejected by the API.
    */
   async createMarketOrder(params: MarketOrderParams): Promise<OrderResult> {
     // Validate minimum order value before sending to API
@@ -363,6 +364,18 @@ export class TradingService {
         success: false,
         errorMsg: `Order amount ($${params.amount.toFixed(2)}) is below Polymarket minimum ($${MIN_ORDER_VALUE_USDC})`,
       };
+    }
+
+    // Validate minimum order size when price is provided
+    // Estimated shares = amount / price
+    if (params.price !== undefined && params.price > 0) {
+      const estimatedShares = params.amount / params.price;
+      if (estimatedShares < MIN_ORDER_SIZE_SHARES) {
+        return {
+          success: false,
+          errorMsg: `Order would result in ~${estimatedShares.toFixed(1)} shares, below Polymarket minimum (${MIN_ORDER_SIZE_SHARES} shares). Increase amount or use a lower price.`,
+        };
+      }
     }
 
     const client = await this.ensureInitialized();

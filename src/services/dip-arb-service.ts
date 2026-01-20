@@ -4,12 +4,15 @@
  * 暴跌套利服务 - 针对 Polymarket 15分钟/5分钟 UP/DOWN 市场
  *
  * 策略原理：
- * 1. 每个市场有一个 "price to beat"（开盘时的 Chainlink 价格）
- * 2. 结算规则：
- *    - UP 赢：结束时价格 >= price to beat
- *    - DOWN 赢：结束时价格 < price to beat
+ * 1. 每个市场有一个 "price to beat" = Chainlink价格在窗口开始时的快照
+ *    - 固定值，在市场开始时确定，存储在 groupItemThreshold 字段
+ * 2. "current price" = 实时 Chainlink 价格 (via crypto_prices_chainlink WebSocket)
+ *    - 用于显示资产当前走势
+ * 3. 结算规则：
+ *    - UP 赢：窗口结束时的 Chainlink 价格 >= price to beat
+ *    - DOWN 赢：窗口结束时的 Chainlink 价格 < price to beat
  *
- * 3. 套利流程：
+ * 4. 套利流程：
  *    - Leg1：检测暴跌 → 买入暴跌侧
  *    - Leg2：等待对冲条件 → 买入另一侧
  *    - 利润：总成本 < $1 时获得无风险利润
@@ -90,8 +93,69 @@ const UNDERLYING_TO_BINANCE: Record<DipArbUnderlying, BinanceSymbol | null> = {
   'BTC': 'BTCUSDT',
   'ETH': 'ETHUSDT',
   'SOL': 'SOLUSDT',
-  'XRP': null, // XRP not available on Binance US
+  'XRP': 'XRPUSDT',
 };
+
+/**
+ * Calculate realistic slippage for paper trading simulation
+ *
+ * Real market slippage is typically 0.5-2%+, not the previous 0-0.5% uniform distribution.
+ * Factors affecting slippage:
+ * - Base market conditions: 0.3-0.7%
+ * - Order size impact: ~0.1% per $100 order value
+ * - Capped at 3% to avoid unrealistic extreme values
+ *
+ * @param shares - Number of shares in the order
+ * @param price - Price per share
+ * @returns Slippage as a decimal (e.g., 0.01 = 1%)
+ */
+function calculateRealisticSlippage(shares: number, price: number): number {
+  // Base slippage: 0.3-0.7% (market conditions, bid-ask spread)
+  const baseSlippage = 0.003 + Math.random() * 0.004;
+
+  // Size impact: ~0.1% per $100 order value (market depth impact)
+  const orderValue = shares * price;
+  const sizeImpact = (orderValue / 100) * 0.001;
+
+  // Total slippage, capped at 3% to avoid unrealistic extreme values
+  return Math.min(baseSlippage + sizeImpact, 0.03);
+}
+
+/**
+ * Calculate dynamic timeout loss based on elapsed time
+ *
+ * Timeout losses should vary based on how long the position was open:
+ * - Early timeout (< 30% of timeout period): Lower loss (2-5%)
+ * - Mid timeout (30-70% of timeout period): Medium loss (5-10%)
+ * - Late timeout (> 70% of timeout period): Higher loss (10-15%)
+ *
+ * This replaces the previous hardcoded 7.5% loss estimate.
+ *
+ * @param elapsedSeconds - Time since leg1 was filled
+ * @param timeoutSeconds - Total timeout period
+ * @returns Estimated loss rate as a decimal (e.g., 0.075 = 7.5%)
+ */
+function calculateTimeoutLossRate(elapsedSeconds: number, timeoutSeconds: number): number {
+  const elapsedRatio = elapsedSeconds / timeoutSeconds;
+
+  // Base loss rate varies by how long we waited
+  let baseLoss: number;
+  if (elapsedRatio < 0.3) {
+    // Early exit: market probably moved against us quickly (2-5%)
+    baseLoss = 0.02 + Math.random() * 0.03;
+  } else if (elapsedRatio < 0.7) {
+    // Mid exit: moderate adverse movement (5-10%)
+    baseLoss = 0.05 + Math.random() * 0.05;
+  } else {
+    // Late exit: significant adverse movement (10-15%)
+    baseLoss = 0.10 + Math.random() * 0.05;
+  }
+
+  // Add some randomness for market volatility
+  const volatilityFactor = 0.9 + Math.random() * 0.2; // ±10%
+
+  return Math.min(baseLoss * volatilityFactor, 0.20); // Cap at 20%
+}
 
 export class DipArbService extends EventEmitter {
   // Dependencies
@@ -116,7 +180,7 @@ export class DipArbService extends EventEmitter {
 
   // Subscriptions
   private marketSubscription: MarketSubscription | null = null;
-  private chainlinkSubscription: Subscription | null = null;
+  private priceSubscription: Subscription | null = null;
 
   // Auto-rotate state
   private rotateCheckInterval: ReturnType<typeof setInterval> | null = null;
@@ -127,6 +191,7 @@ export class DipArbService extends EventEmitter {
   private currentDuration: DipArbDurationString = '15m';
   private preferredDuration: DipArbDurationString = '15m';
   private isSearchingMarket = false;
+  private searchStartTime: number | null = null;  // For health monitoring timeout detection
   private upgradeCheckInterval: ReturnType<typeof setInterval> | null = null;
 
   // Pending redemption state (for background redemption after market resolution)
@@ -286,6 +351,8 @@ export class DipArbService extends EventEmitter {
             );
 
             if (upToken?.tokenId && downToken?.tokenId) {
+              // Note: priceToBeat is fetched dynamically via /prices-history API in start()
+              // It's the Chainlink price at window start timestamp
               results.push({
                 name: gm.question,
                 slug: gm.slug,
@@ -295,6 +362,7 @@ export class DipArbService extends EventEmitter {
                 underlying: parseUnderlyingFromSlug(gm.slug),
                 durationMinutes: parseDurationFromSlug(gm.slug),
                 endTime: gm.endDate,
+                // priceToBeat is set in start() via fetchPriceToBeat()
               });
             }
             break; // Success, exit retry loop
@@ -337,83 +405,100 @@ export class DipArbService extends EventEmitter {
       ? durationPriority.slice(startIndex)
       : durationPriority;
 
-    // Emit searching event
-    this.isSearchingMarket = true;
-    this.emit('searching', { duration: preferDuration, message: `Searching for ${preferDuration} markets...` });
+    // Track search start time for health monitoring
+    this.searchStartTime = Date.now();
+    let foundMarket: DipArbMarketConfig | null = null;
 
-    // Try each duration in priority order
-    for (const duration of durationsToTry) {
-      // Skip if fallback disabled and not preferred duration
-      if (!enableFallback && duration !== preferDuration) {
-        continue;
-      }
+    try {
+      // Emit searching event
+      this.isSearchingMarket = true;
+      this.emit('searching', { duration: preferDuration, message: `Searching for ${preferDuration} markets...`, coin });
 
-      const scanOptions: DipArbScanOptions = {
-        coin: coin || 'all',
-        duration,
-        minMinutesUntilEnd: 3,
-        maxMinutesUntilEnd: this.getMaxMinutesForDuration(duration),
-        limit: 10,
-      };
-
-      this.log(`Scanning for ${duration} markets: coin=${scanOptions.coin}, window=${scanOptions.minMinutesUntilEnd}-${scanOptions.maxMinutesUntilEnd}min`);
-
-      // Emit searching event for current duration
-      if (duration !== preferDuration) {
-        this.emit('searching', { duration, message: `Trying ${duration} markets (${preferDuration} unavailable)...`, isFallback: true });
-      }
-
-      const markets = await this.scanUpcomingMarkets(scanOptions);
-
-      if (markets.length > 0) {
-        this.log(`Found ${markets.length} ${duration} market(s): ${markets.map(m => `${m.underlying} (ends ${Math.round((m.endTime.getTime() - Date.now()) / 60000)}min)`).join(', ')}`);
-
-        // Find the best market (prefer specified coin, then by time)
-        let bestMarket = markets[0];
-        if (coin) {
-          const coinMarket = markets.find(m => m.underlying === coin);
-          if (coinMarket) {
-            bestMarket = coinMarket;
-          }
+      // Try each duration in priority order
+      for (const duration of durationsToTry) {
+        // Skip if fallback disabled and not preferred duration
+        if (!enableFallback && duration !== preferDuration) {
+          continue;
         }
 
-        // Track current duration for upgrade checking
-        this.currentDuration = duration;
+        const scanOptions: DipArbScanOptions = {
+          coin: coin || 'all',
+          duration,
+          minMinutesUntilEnd: 3,
+          maxMinutesUntilEnd: this.getMaxMinutesForDuration(duration),
+          limit: 10,
+        };
 
-        // Log if we're falling back to a lower priority duration
+        this.log(`Scanning for ${duration} markets: coin=${scanOptions.coin}, window=${scanOptions.minMinutesUntilEnd}-${scanOptions.maxMinutesUntilEnd}min`);
+
+        // Emit searching event for current duration
         if (duration !== preferDuration) {
-          this.log(`⚠️ Falling back to ${duration} market (${preferDuration} unavailable)`);
-          // Start checking for higher priority markets
-          this.startUpgradeCheck();
-        } else {
-          // At preferred duration, stop any upgrade checks
-          this.stopUpgradeCheck();
+          this.emit('searching', { duration, message: `Trying ${duration} markets (${preferDuration} unavailable)...`, isFallback: true, coin });
         }
 
-        this.isSearchingMarket = false;
-        this.emit('marketFound', {
-          market: bestMarket,
-          duration: this.currentDuration,
-          isFallback: duration !== preferDuration,
-        });
+        const markets = await this.scanUpcomingMarkets(scanOptions);
 
-        await this.start(bestMarket);
-        return bestMarket;
+        if (markets.length > 0) {
+          this.log(`Found ${markets.length} ${duration} market(s): ${markets.map(m => `${m.underlying} (ends ${Math.round((m.endTime.getTime() - Date.now()) / 60000)}min)`).join(', ')}`);
+
+          // Find the best market (prefer specified coin, then by time)
+          let bestMarket = markets[0];
+          if (coin) {
+            const coinMarket = markets.find(m => m.underlying === coin);
+            if (coinMarket) {
+              bestMarket = coinMarket;
+            }
+          }
+
+          // Track current duration for upgrade checking
+          this.currentDuration = duration;
+
+          // Log if we're falling back to a lower priority duration
+          if (duration !== preferDuration) {
+            this.log(`⚠️ Falling back to ${duration} market (${preferDuration} unavailable)`);
+            // Start checking for higher priority markets
+            this.startUpgradeCheck();
+          } else {
+            // At preferred duration, stop any upgrade checks
+            this.stopUpgradeCheck();
+          }
+
+          this.emit('marketFound', {
+            market: bestMarket,
+            duration: this.currentDuration,
+            isFallback: duration !== preferDuration,
+            coin,
+          });
+
+          await this.start(bestMarket);
+          foundMarket = bestMarket;
+          return foundMarket;
+        }
+
+        this.log(`No ${duration} markets found, trying next duration...`);
       }
 
-      this.log(`No ${duration} markets found, trying next duration...`);
+      // No markets found at any duration
+      this.log('No suitable markets found at any duration');
+      this.emit('noMarketsAvailable', {
+        triedDurations: durationsToTry,
+        willRetry: true,
+        retryIntervalMs: 30000,
+        coin,
+      });
+
+      return null;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.log(`❌ findAndStart failed: ${errorMessage}`);
+      this.emit('error', { error, phase: 'search', coin });
+      return null;
+    } finally {
+      // ALWAYS clear searching state - this prevents stuck "Finding round" states
+      this.isSearchingMarket = false;
+      this.searchStartTime = null;
+      this.emit('searchComplete', { success: !!foundMarket, coin });
     }
-
-    // No markets found at any duration
-    this.isSearchingMarket = false;
-    this.log('No suitable markets found at any duration');
-    this.emit('noMarketsAvailable', {
-      triedDurations: durationsToTry,
-      willRetry: true,
-      retryIntervalMs: 30000,
-    });
-
-    return null;
   }
 
   /**
@@ -455,6 +540,103 @@ export class DipArbService extends EventEmitter {
       clearInterval(this.upgradeCheckInterval);
       this.upgradeCheckInterval = null;
       this.log('Stopped upgrade check');
+    }
+  }
+
+  /**
+   * Fetch the Price to Beat from Polymarket's crypto-price API
+   *
+   * Price to Beat = Chainlink price at window START timestamp
+   * API: GET https://polymarket.com/api/crypto/crypto-price
+   *      ?symbol={BTC|ETH|SOL|XRP}
+   *      &eventStartTime={windowStart ISO}
+   *      &variant={fifteen|hourly}
+   *      &endDate={windowEnd ISO}
+   *
+   * Response: { openPrice: number, closePrice: number|null, ... }
+   *
+   * @param market - The market config
+   * @returns The price to beat (openPrice), or 0 if unavailable
+   */
+  private async fetchPriceToBeat(market: DipArbMarketConfig): Promise<number> {
+    try {
+      // Calculate window times
+      const endTimeMs = market.endTime instanceof Date
+        ? market.endTime.getTime()
+        : (typeof market.endTime === 'string'
+          ? new Date(market.endTime).getTime()
+          : market.endTime);
+
+      const windowStartMs = endTimeMs - (market.durationMinutes * 60 * 1000);
+      const eventStartTime = new Date(windowStartMs).toISOString();
+      const endDate = new Date(endTimeMs).toISOString();
+
+      // Determine variant based on duration
+      const variant = market.durationMinutes <= 15 ? 'fifteen' : 'hourly';
+
+      console.log(`[DipArb] Fetching Price to Beat for ${market.underlying}...`);
+      console.log(`[DipArb]   Window: ${eventStartTime} to ${endDate} (${variant})`);
+
+      // Build URL for Polymarket's crypto-price API
+      const url = new URL('https://polymarket.com/api/crypto/crypto-price');
+      url.searchParams.set('symbol', market.underlying);
+      url.searchParams.set('eventStartTime', eventStartTime);
+      url.searchParams.set('variant', variant);
+      url.searchParams.set('endDate', endDate);
+
+      // Retry logic for rate limiting
+      let lastError: Error | null = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const response = await fetch(url.toString());
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          }
+
+          const data = await response.json() as {
+            openPrice?: number | null;
+            closePrice?: number | null;
+            timestamp?: number;
+            completed?: boolean;
+            incomplete?: boolean;
+            cached?: boolean;
+            error?: string;
+          };
+
+          // Check for error in response body (API returns 200 but with error field)
+          if (data.error) {
+            if (data.error.includes('429') && attempt < 3) {
+              console.log(`[DipArb] ⚠️ Rate limited, retrying in ${attempt}s... (attempt ${attempt}/3)`);
+              await new Promise(r => setTimeout(r, attempt * 1000));
+              continue;
+            }
+            throw new Error(data.error);
+          }
+
+          if (data.openPrice && data.openPrice > 0) {
+            console.log(`[DipArb] ✅ Price to Beat: $${data.openPrice.toLocaleString()} (from Polymarket API)`);
+            this.log(`✅ Price to Beat: $${data.openPrice.toLocaleString()} (Chainlink @ window start)`);
+            return data.openPrice;
+          } else {
+            console.log(`[DipArb] ⚠️ openPrice not available yet (market may not have started)`);
+            this.log(`⚠️ Price to Beat not available - openPrice is ${data.openPrice}`);
+            return 0;
+          }
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          if (attempt < 3) {
+            console.log(`[DipArb] ⚠️ Fetch attempt ${attempt} failed: ${lastError.message}, retrying...`);
+            await new Promise(r => setTimeout(r, attempt * 1000));
+          }
+        }
+      }
+
+      throw lastError || new Error('Failed after 3 attempts');
+    } catch (error) {
+      console.log(`[DipArb] ❌ Failed to fetch Price to Beat: ${error instanceof Error ? error.message : String(error)}`);
+      this.log(`❌ Price to Beat fetch failed: ${error instanceof Error ? error.message : String(error)}`);
+      return 0;
     }
   }
 
@@ -595,6 +777,8 @@ export class DipArbService extends EventEmitter {
     }
 
     // Connect realtime service with retry logic
+    console.log(`[DipArb] Config state: debug=${this.config.debug}, paperMode=${this.config.paperMode}`);
+    console.log(`[DipArb] Connecting to WebSocket...`);
     this.realtimeService.connect();
 
     // Wait for WebSocket connection with retries
@@ -640,11 +824,15 @@ export class DipArbService extends EventEmitter {
     // If still not connected, log warning but continue
     // (Polling fallback disabled - WebSocket retry should be sufficient)
     if (!connected) {
+      console.log('[DipArb] ⚠️ WebSocket failed after all retries');
       this.log('⚠️ WebSocket failed after all retries. Bot will continue but may not receive orderbook updates.');
       this.log('💡 Check network connectivity and firewall settings.');
+    } else {
+      console.log('[DipArb] ✅ WebSocket connected');
     }
 
     // Subscribe to market orderbook
+    console.log('[DipArb] Subscribing to orderbook...');
     this.log(`Subscribing to tokens: UP=${market.upTokenId.slice(0, 20)}..., DOWN=${market.downTokenId.slice(0, 20)}...`);
     this.marketSubscription = this.realtimeService.subscribeMarkets(
       [market.upTokenId, market.downTokenId],
@@ -663,31 +851,30 @@ export class DipArbService extends EventEmitter {
       }
     );
 
-    // Subscribe to Chainlink prices for the underlying asset
-    // Format: ETH -> ETH/USD
-    const chainlinkSymbol = `${market.underlying}/USD`;
-    this.log(`Subscribing to Chainlink prices: ${chainlinkSymbol}`);
-    this.chainlinkSubscription = this.realtimeService.subscribeCryptoChainlinkPrices(
+    // Subscribe to Chainlink price feed for the underlying asset
+    // Symbol format must be lowercase: eth/usd, btc/usd, sol/usd, xrp/usd
+    const chainlinkSymbol = `${market.underlying.toLowerCase()}/usd`;
+    console.log(`[DipArb] Subscribing to Chainlink price feed: ${chainlinkSymbol}`);
+    this.log(`📡 Subscribing to Chainlink oracle: ${chainlinkSymbol}`);
+
+    this.priceSubscription = this.realtimeService.subscribeCryptoChainlinkPrices(
       [chainlinkSymbol],
       {
-        onPrice: (price: CryptoPrice) => {
-          this.log(`📊 Chainlink price received: ${price.symbol} = $${price.price.toFixed(2)}`);
-          this.handleChainlinkPriceUpdate(price);
-        },
+        onPrice: (price) => this.handleUnderlyingPriceUpdate(price),
       }
     );
+    console.log(`[DipArb] 📡 Subscribed to live Chainlink feed: ${chainlinkSymbol}`);
+    this.log(`📡 Live price tracking via Chainlink: ${chainlinkSymbol}`);
 
-    // Wait for first Chainlink price with timeout
-    // This ensures priceToBeat is accurate when first round starts
-    const chainlinkTimeout = 15000; // 15 second timeout
-    const waitStart = Date.now();
-    while (this.currentUnderlyingPrice === 0 && Date.now() - waitStart < chainlinkTimeout) {
-      await new Promise(r => setTimeout(r, 500));
-    }
-    if (this.currentUnderlyingPrice === 0) {
-      this.log(`⚠️ WARNING: No Chainlink price received after ${chainlinkTimeout / 1000}s - priceToBeat will be $0`);
+    // Fetch Price to Beat from historical prices API
+    // Price to Beat = Chainlink price at window START timestamp (fixed target)
+    const priceToBeat = await this.fetchPriceToBeat(market);
+    if (priceToBeat > 0) {
+      market.priceToBeat = priceToBeat;
+      this.market = market; // Update stored market with priceToBeat
     } else {
-      this.log(`✅ Chainlink price ready: $${this.currentUnderlyingPrice.toFixed(2)}`);
+      console.log(`[DipArb] ⚠️ Could not determine Price to Beat - market resolution may be inaccurate`);
+      this.log(`⚠️ WARNING: Price to Beat unavailable - will use first Chainlink price as fallback`);
     }
 
     // ✅ FIX: Check and merge existing pairs at startup
@@ -696,6 +883,7 @@ export class DipArbService extends EventEmitter {
     }
 
     this.emit('started', market);
+    console.log(`[DipArb] ✅ start() complete for ${market.underlying} - monitoring active`);
     this.log('Monitoring for dip arbitrage opportunities...');
   }
 
@@ -813,18 +1001,21 @@ export class DipArbService extends EventEmitter {
 
         // For paper mode, calculate and emit the loss (no real exit needed)
         if (this.config.paperMode) {
-          // Estimate loss: assume we'd sell at ~5-10% slippage from entry
-          const estimatedSlippage = 0.075; // 7.5% average
-          const estimatedLoss = positionData.leg1Price * positionData.leg1Shares * estimatedSlippage;
+          // FIXED: Use dynamic timeout loss based on elapsed time instead of hardcoded 7.5%
+          const timeoutSeconds = this.getLeg2TimeoutSeconds();
+          const estimatedLossRate = calculateTimeoutLossRate(timeSinceLeg1, timeoutSeconds);
+          const estimatedLoss = positionData.leg1Price * positionData.leg1Shares * estimatedLossRate;
 
-          this.log(`📝 [PAPER] Recording timeout loss: ~$${estimatedLoss.toFixed(2)}`);
+          this.log(`📝 [PAPER] Recording timeout loss: ~$${estimatedLoss.toFixed(2)} (${(estimatedLossRate * 100).toFixed(1)}% of position)`);
 
           this.emit('paperTrade', {
             type: 'exit',
             side: positionData.leg1Side,
             shares: positionData.leg1Shares,
-            price: positionData.leg1Price * (1 - estimatedSlippage),
+            price: positionData.leg1Price * (1 - estimatedLossRate),
             profit: -estimatedLoss,
+            expectedPrice: positionData.leg1Price,   // Entry price as expected
+            slippagePercent: estimatedLossRate,      // Dynamic timeout loss rate
             marketName: positionData.marketName,
             conditionId: positionData.marketConditionId,
             timestamp: Date.now(),
@@ -890,8 +1081,10 @@ export class DipArbService extends EventEmitter {
 
   /**
    * Stop monitoring
+   * @param options.skipUnsubscribe - Skip unsubscribe for ended markets (used during rotation)
+   * @param options.silent - Don't emit 'stopped' event (used during rotation to avoid "unexpected" warnings)
    */
-  async stop(): Promise<void> {
+  async stop(options?: { skipUnsubscribe?: boolean; silent?: boolean }): Promise<void> {
     if (!this.isRunning) return;
 
     this.isRunning = false;
@@ -906,24 +1099,35 @@ export class DipArbService extends EventEmitter {
       this.log('Stopped HTTP polling fallback');
     }
 
-    // Unsubscribe
-    if (this.marketSubscription) {
-      this.marketSubscription.unsubscribe();
+    // Unsubscribe (skip for ended markets during rotation to avoid "Invalid request body" errors)
+    if (!options?.skipUnsubscribe) {
+      if (this.marketSubscription) {
+        try {
+          this.marketSubscription.unsubscribe();
+        } catch (err) {
+          this.log(`Warning: Failed to unsubscribe from market: ${err}`);
+        }
+        this.marketSubscription = null;
+      }
+
+      if (this.priceSubscription) {
+        try {
+          this.priceSubscription.unsubscribe();
+        } catch (err) {
+          this.log(`Warning: Failed to unsubscribe from price feed: ${err}`);
+        }
+        this.priceSubscription = null;
+      }
+    } else {
+      // Just clear references without sending unsubscribe messages
+      this.log('Skipping unsubscribe (market ended)');
       this.marketSubscription = null;
+      this.priceSubscription = null;
     }
 
-    if (this.chainlinkSubscription) {
-      this.chainlinkSubscription.unsubscribe();
-      this.chainlinkSubscription = null;
-    }
-
-    // Disconnect WebSocket to ensure clean state for next start
-    // This prevents foreign key constraint errors when switching coins
-    this.realtimeService.disconnect();
-    this.log('WebSocket disconnected');
-
-    // Small delay to ensure server processes the disconnect
-    await new Promise(resolve => setTimeout(resolve, 500));
+    // NOTE: Do NOT disconnect WebSocket here!
+    // In parallel mode, other DipArbService instances may still be using the connection.
+    // Each service only unsubscribes from its own market's tokens.
 
     // Clear round state to prevent stale data during market rotation
     this.currentRound = null;
@@ -937,7 +1141,10 @@ export class DipArbService extends EventEmitter {
     this.log(`Rounds completed: ${this.stats.roundsSuccessful}`);
     this.log(`Total profit: $${this.stats.totalProfit.toFixed(2)}`);
 
-    this.emit('stopped');
+    // Don't emit 'stopped' during rotation to avoid "unexpected" warnings
+    if (!options?.silent) {
+      this.emit('stopped');
+    }
   }
 
   /**
@@ -1010,6 +1217,31 @@ export class DipArbService extends EventEmitter {
       downAsk,
       sum: upAsk + downAsk,
     };
+  }
+
+  /**
+   * Check if service is currently searching for a market
+   */
+  isSearching(): boolean {
+    return this.isSearchingMarket;
+  }
+
+  /**
+   * Get when the current search started (for timeout detection)
+   */
+  getSearchStartTime(): number | null {
+    return this.searchStartTime;
+  }
+
+  /**
+   * Force stop searching state (used by health monitoring for stuck recovery)
+   * Only use this for timeout/error recovery scenarios
+   */
+  forceStopSearching(): void {
+    this.log('⚠️ Force stopping search (timeout/recovery)');
+    this.isSearchingMarket = false;
+    this.searchStartTime = null;
+    this.emit('searchComplete', { success: false, forced: true });
   }
 
   // ===== Public API: Manual Execution =====
@@ -1379,10 +1611,12 @@ export class DipArbService extends EventEmitter {
     try {
       this.isExecuting = true;
 
-      // Simulate fill at signal price with small random slippage
-      const slippagePercent = (Math.random() * 0.5); // 0-0.5% simulated slippage
-      const simulatedPrice = signal.currentPrice * (1 + slippagePercent / 100);
+      // Simulate fill at signal price with realistic slippage
+      // FIXED: Use realistic slippage (0.5-2%+) instead of optimistic 0-0.5%
       const shares = this.config.shares;
+      const slippageDecimal = calculateRealisticSlippage(shares, signal.currentPrice);
+      const slippagePercent = slippageDecimal * 100;
+      const simulatedPrice = signal.currentPrice * (1 + slippageDecimal);
       const cost = shares * simulatedPrice;
 
       // Simulate execution delay (50-150ms)
@@ -1436,6 +1670,8 @@ export class DipArbService extends EventEmitter {
         shares,
         price: simulatedPrice,
         cost,
+        expectedPrice: signal.currentPrice,          // Signal price before slippage
+        slippagePercent: slippageDecimal,            // As decimal (e.g., 0.005 for 0.5%)
         marketName: this.market.name,
         conditionId: this.market.conditionId,
         timestamp: Date.now(),
@@ -1671,10 +1907,12 @@ export class DipArbService extends EventEmitter {
 
       const leg1 = this.currentRound.leg1;
 
-      // Simulate fill at signal price with small random slippage
-      const slippagePercent = (Math.random() * 0.5); // 0-0.5% simulated slippage
-      const simulatedPrice = signal.currentPrice * (1 + slippagePercent / 100);
+      // Simulate fill at signal price with realistic slippage
+      // FIXED: Use realistic slippage (0.5-2%+) instead of optimistic 0-0.5%
       const shares = leg1.shares; // Match Leg1 shares for balanced hedge
+      const slippageDecimal = calculateRealisticSlippage(shares, signal.currentPrice);
+      const slippagePercent = slippageDecimal * 100;
+      const simulatedPrice = signal.currentPrice * (1 + slippageDecimal);
       const cost = shares * simulatedPrice;
 
       const actualTotalCost = leg1.price + simulatedPrice;
@@ -1731,6 +1969,8 @@ export class DipArbService extends EventEmitter {
         totalCost: actualTotalCost,
         profit: netProfitPerTrade, // ✅ Now sends NET profit (after fees)
         profitRate: netProfitRate,
+        expectedPrice: signal.currentPrice,          // Signal price before slippage
+        slippagePercent: slippagePercent / 100,      // As decimal (e.g., 0.005 for 0.5%)
         marketName: this.market.name,
         conditionId: this.market.conditionId,
         timestamp: Date.now(),
@@ -1863,6 +2103,11 @@ export class DipArbService extends EventEmitter {
     const now = Date.now();
     this.orderbookUpdateCount++;
 
+    // Log first orderbook update (always, not just in debug mode)
+    if (this.orderbookUpdateCount === 1) {
+      console.log(`[DipArb] 📡 First orderbook update received for ${this.market.underlying}`);
+    }
+
     if (this.config.debug && now - this.lastOrderbookUpdateTime > 5000) {
       // Log update rate every 5 seconds
       const elapsed = now - this.lastOrderbookUpdateTime;
@@ -1987,18 +2232,38 @@ export class DipArbService extends EventEmitter {
     return null;
   }
 
-  private handleChainlinkPriceUpdate(price: CryptoPrice): void {
+  private handleUnderlyingPriceUpdate(price: CryptoPrice): void {
     if (!this.market) return;
 
-    // Only handle updates for our underlying (symbol format: ETH/USD)
-    const expectedSymbol = `${this.market.underlying}/USD`;
+    // Only handle updates for our underlying (symbol format: eth/usd - lowercase)
+    const expectedSymbol = `${this.market.underlying.toLowerCase()}/usd`;
     if (price.symbol !== expectedSymbol) return;
 
     if (this.config.debug) {
-      this.log(`Chainlink price update: ${price.symbol} = $${price.price.toFixed(2)}`);
+      this.log(`Underlying price update: ${price.symbol} = $${price.price.toFixed(2)}`);
     }
 
+    // currentUnderlyingPrice = LIVE Chainlink price (for tracking/display)
+    // This is NOT the same as priceToBeat (which is fixed at window start)
     this.currentUnderlyingPrice = price.price;
+
+    // Fallback: If priceToBeat couldn't be fetched from API, use first Chainlink price
+    if (this.currentRound && this.currentRound.priceToBeat === 0 && price.price > 0) {
+      this.currentRound.priceToBeat = price.price;
+      console.log(`[DipArb] ⚠️ Using fallback Price to Beat from Chainlink: $${price.price.toLocaleString()}`);
+      this.log(`⚠️ Fallback: Price to Beat set from live Chainlink: $${price.price.toLocaleString()}`);
+
+      // Emit newRound event with updated priceToBeat so frontend updates
+      const event: DipArbNewRoundEvent = {
+        roundId: this.currentRound.roundId,
+        priceToBeat: price.price,
+        upOpen: this.currentRound.openPrices.up,
+        downOpen: this.currentRound.openPrices.down,
+        startTime: this.currentRound.startTime,
+        endTime: this.currentRound.endTime,
+      };
+      this.emit('newRound', event);
+    }
 
     // Emit price update event
     if (this.currentRound) {
@@ -2027,12 +2292,27 @@ export class DipArbService extends EventEmitter {
     // If no current round or current round is completed/expired, start new round
     if (!this.currentRound || this.currentRound.phase === 'completed' || this.currentRound.phase === 'expired') {
       // Check if market is still active
-      if (new Date() >= this.market.endTime) {
+      const now = new Date();
+      const endTime = this.market.endTime instanceof Date
+        ? this.market.endTime
+        : new Date(this.market.endTime);
+
+      if (now >= endTime) {
         // Always log market end (not just in debug mode)
         if (!this.currentRound) {
-          console.log('[DipArb] Market has ended before round could start');
+          console.log(`[DipArb] Market has ended before round could start (now=${now.toISOString()}, end=${endTime.toISOString()})`);
         }
         return;
+      }
+
+      // Price to Beat = Chainlink price at window START (fixed when market begins)
+      // This comes from groupItemThreshold in the market data
+      // currentUnderlyingPrice = LIVE Chainlink price (for tracking/display)
+      const priceToBeat = this.market.priceToBeat || 0;
+
+      // Log once when creating first round
+      if (!this.currentRound) {
+        console.log(`[DipArb] Creating first round for ${this.market.underlying} (endTime=${endTime.toISOString()}, priceToBeat=$${priceToBeat.toLocaleString()}, currentPrice=$${(this.currentUnderlyingPrice || 0).toLocaleString()})`);
       }
 
       // Get current prices
@@ -2043,23 +2323,35 @@ export class DipArbService extends EventEmitter {
         this.log(`🆕 Creating new round: UP=${upPrice.toFixed(4)}, DOWN=${downPrice.toFixed(4)}, Sum=${(upPrice + downPrice).toFixed(4)}`);
       }
 
-      // Use current underlying price as price to beat (or fallback to 0)
-      // Note: If priceToBeat is 0, Chainlink subscription hasn't received data yet
-      const priceToBeat = this.currentUnderlyingPrice || 0;
+      // Warn if price to beat is missing (market data issue)
       if (priceToBeat === 0) {
-        this.log(`⚠️ WARNING: Price to beat is $0 - Chainlink price feed not yet received`);
+        this.log(`⚠️ WARNING: Price to beat is $0 - groupItemThreshold not set in market data`);
+        this.log(`   This may indicate the market hasn't started yet or data wasn't fetched correctly`);
       }
 
       // Create new round with ACTUAL market end time from Polymarket
       const roundId = `${this.market.slug}-${Date.now()}`;
+      // Ensure endTime is a proper timestamp
+      const marketEndTime = this.market.endTime instanceof Date
+        ? this.market.endTime.getTime()
+        : (typeof this.market.endTime === 'string'
+          ? new Date(this.market.endTime).getTime()
+          : this.market.endTime);
       this.currentRound = createDipArbRoundState(
         roundId,
         priceToBeat,
         upPrice,
         downPrice,
-        this.market.endTime,  // Use actual market end time, NOT calculated from duration
+        marketEndTime,  // Use actual market end time, NOT calculated from duration
         this.market.durationMinutes  // Fallback only
       );
+
+      // Immediate fallback: If priceToBeat is 0 but we already have a Chainlink price, use it now
+      // This handles the case where Chainlink updates arrived BEFORE the round was created
+      if (this.currentRound.priceToBeat === 0 && this.currentUnderlyingPrice && this.currentUnderlyingPrice > 0) {
+        this.currentRound.priceToBeat = this.currentUnderlyingPrice;
+        console.log(`[DipArb] ⚠️ Immediate fallback: Price to Beat set from existing Chainlink: $${this.currentUnderlyingPrice.toLocaleString()}`);
+      }
 
       // Clear price history for new round - we only want to detect instant drops within this round
       const oldHistorySize = this.priceHistory.length;
@@ -2070,9 +2362,12 @@ export class DipArbService extends EventEmitter {
 
       this.stats.roundsMonitored++;
 
+      // Use the potentially updated priceToBeat from fallback
+      const finalPriceToBeat = this.currentRound.priceToBeat;
+
       const event: DipArbNewRoundEvent = {
         roundId,
-        priceToBeat,
+        priceToBeat: finalPriceToBeat,
         upOpen: upPrice,
         downOpen: downPrice,
         startTime: this.currentRound.startTime,
@@ -2080,7 +2375,8 @@ export class DipArbService extends EventEmitter {
       };
 
       this.emit('newRound', event);
-      this.log(`✅ New round #${this.stats.roundsMonitored}: ${roundId.slice(0, 30)}..., Price to Beat: $${priceToBeat.toFixed(2)} (cleared ${oldHistorySize} history entries)`);
+      console.log(`[DipArb] ✅ New round for ${this.market.underlying}: Target=$${finalPriceToBeat.toFixed(2)}, UP=${upPrice.toFixed(4)}, DOWN=${downPrice.toFixed(4)}`);
+      this.log(`✅ New round #${this.stats.roundsMonitored}: ${roundId.slice(0, 30)}..., Price to Beat: $${finalPriceToBeat.toFixed(2)} (cleared ${oldHistorySize} history entries)`);
     } else if (this.config.debug) {
       this.log(`⏳ Round already active: ${this.currentRound.roundId.slice(0, 30)}..., phase: ${this.currentRound.phase}`);
     }
@@ -2164,6 +2460,8 @@ export class DipArbService extends EventEmitter {
           price: soldPrice,
           cost: -exitAmount, // Negative cost = received money
           profit: -Math.abs(loss),
+          expectedPrice: currentPrice,              // Price before slippage
+          slippagePercent: simulatedSlippage,       // As decimal (e.g., 0.01 for 1%)
           marketName: this.market.name,
           conditionId: this.market.conditionId,
           timestamp: Date.now(),
@@ -3021,13 +3319,21 @@ export class DipArbService extends EventEmitter {
 
     this.log('🔄 Starting rotation check interval (30s)');
 
-    // Check every 30 seconds
+    // Check every 30 seconds - with error handling to prevent silent failures
     this.rotateCheckInterval = setInterval(() => {
-      this.checkRotation();
+      this.checkRotation().catch((err) => {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        this.log(`❌ Rotation check failed: ${errorMessage}`);
+        this.emit('error', { error: err, phase: 'rotation' });
+      });
     }, 30000);
 
-    // Also check immediately
-    this.checkRotation();
+    // Also check immediately - with error handling
+    this.checkRotation().catch((err) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      this.log(`❌ Initial rotation check failed: ${errorMessage}`);
+      this.emit('error', { error: err, phase: 'rotation' });
+    });
   }
 
   private stopRotateCheck(): void {
@@ -3130,6 +3436,8 @@ export class DipArbService extends EventEmitter {
           cost: amountReceived,
           profit: netProfit, // ✅ Use NET profit
           profitRate: totalCost > 0 ? netProfit / (totalCost + totalFees) : 0,
+          expectedPrice: 1,                          // Settlement at $1 (no price uncertainty)
+          slippagePercent: 0,                        // No slippage on settlement
           marketName: pending.market.name,
           conditionId: pending.market.conditionId,
           timestamp: Date.now(),
@@ -3256,14 +3564,20 @@ export class DipArbService extends EventEmitter {
     const timeLeftMin = (timeLeftSec / 60).toFixed(1);
     this.log(`🔄 checkRotation: ${timeLeftMin}min until end, preload=${(preloadMs / 60000).toFixed(1)}min, nextMarket=${this.nextMarket?.slug || 'none'}`);
 
-    // Preload next market when close to end
+    // Preload next market when close to end - with error handling
     if (timeUntilEnd <= preloadMs && !this.nextMarket) {
       this.log('Preloading next market...');
-      this.nextMarket = await this.findNextMarket();
-      if (this.nextMarket) {
-        this.log(`Next market ready: ${this.nextMarket.slug}`);
-      } else {
-        this.log('No next market found during preload');
+      try {
+        this.nextMarket = await this.findNextMarket();
+        if (this.nextMarket) {
+          this.log(`Next market ready: ${this.nextMarket.slug}`);
+        } else {
+          this.log('No next market found during preload');
+        }
+      } catch (preloadError) {
+        const errorMessage = preloadError instanceof Error ? preloadError.message : String(preloadError);
+        this.log(`⚠️ Preload failed: ${errorMessage}`);
+        // Don't rethrow - we'll try again at rotation time
       }
     }
 
@@ -3271,7 +3585,7 @@ export class DipArbService extends EventEmitter {
     if (timeUntilEnd <= 0) {
       this.log(`Market ended ${Math.round(-timeUntilEnd / 1000)}s ago, initiating rotation...`);
 
-      // Settle if configured and has position
+      // Settle if configured and has position - with error handling
       if (this.autoRotateConfig.autoSettle && this.currentRound?.leg1) {
         const strategy = this.autoRotateConfig.settleStrategy || 'redeem';
 
@@ -3281,44 +3595,47 @@ export class DipArbService extends EventEmitter {
           this.log(`Position added to pending redemption queue (will redeem after ${this.autoRotateConfig.redeemWaitMinutes || 5}min)`);
         } else {
           // For sell strategy, execute immediately
-          const settleResult = await this.settle('sell');
-          this.emit('settled', settleResult);
+          try {
+            const settleResult = await this.settle('sell');
+            this.emit('settled', settleResult);
+          } catch (settleError) {
+            const errorMessage = settleError instanceof Error ? settleError.message : String(settleError);
+            this.log(`⚠️ Settle failed during rotation: ${errorMessage}`);
+            this.emit('error', { error: settleError, phase: 'settle' });
+            // Continue with rotation despite settle failure
+          }
         }
       }
 
-      // Rotate to next market
-      if (this.nextMarket) {
-        const previousMarket = this.market;
-        const newMarket = this.nextMarket;
-        this.nextMarket = null;
+      // Rotate to next market - with error handling
+      const previousMarket = this.market;
+      let newMarket = this.nextMarket;
+      this.nextMarket = null;
 
-        // Stop current market (this clears the rotate check interval)
-        await this.stop();
+      // If no preloaded market, try to find one now
+      if (!newMarket) {
+        this.log('No preloaded market, searching...');
+        try {
+          newMarket = await this.findNextMarket();
+        } catch (findError) {
+          const errorMessage = findError instanceof Error ? findError.message : String(findError);
+          this.log(`❌ Failed to find next market: ${errorMessage}`);
+          this.emit('error', { error: findError, phase: 'rotation' });
+        }
+      }
+
+      if (newMarket) {
+        // Stop current market - skip unsubscribe since market has ended
+        try {
+          await this.stop({ skipUnsubscribe: true, silent: true });
+        } catch (stopError) {
+          const errorMessage = stopError instanceof Error ? stopError.message : String(stopError);
+          this.log(`⚠️ Stop during rotation failed: ${errorMessage}`);
+          // Continue anyway - we need to start the new market
+        }
 
         // Start new market
-        await this.start(newMarket);
-
-        // Restart the rotate check interval for the new market
-        this.startRotateCheck();
-
-        const event: DipArbRotateEvent = {
-          previousMarket: previousMarket.conditionId,
-          newMarket: newMarket.conditionId,
-          reason: 'marketEnded',
-          timestamp: Date.now(),
-        };
-        this.emit('rotate', event);
-      } else {
-        // Try to find a market
-        this.log('No preloaded market, searching...');
-        const newMarket = await this.findNextMarket();
-        if (newMarket) {
-          const previousMarket = this.market;
-
-          // Stop current market (this clears the rotate check interval)
-          await this.stop();
-
-          // Start new market
+        try {
           await this.start(newMarket);
 
           // Restart the rotate check interval for the new market
@@ -3331,9 +3648,26 @@ export class DipArbService extends EventEmitter {
             timestamp: Date.now(),
           };
           this.emit('rotate', event);
-        } else {
-          this.log('No next market available, stopping...');
-          await this.stop();
+        } catch (startError) {
+          const errorMessage = startError instanceof Error ? startError.message : String(startError);
+          this.log(`❌ Start during rotation failed: ${errorMessage}`);
+          this.emit('rotationFailed', {
+            error: startError,
+            previousMarket: previousMarket.conditionId,
+            attemptedMarket: newMarket.conditionId,
+          });
+          // Don't leave in broken state - ensure we're stopped
+          this.isRunning = false;
+        }
+      } else {
+        this.log('No next market available, stopping...');
+        // Market ended with no next market - skip unsubscribe but DO emit stopped
+        try {
+          await this.stop({ skipUnsubscribe: true });
+        } catch (stopError) {
+          const errorMessage = stopError instanceof Error ? stopError.message : String(stopError);
+          this.log(`⚠️ Final stop failed: ${errorMessage}`);
+          this.isRunning = false;
         }
       }
     }
@@ -3488,6 +3822,8 @@ export class DipArbService extends EventEmitter {
         cost: amountReceived,
         profit: netProfit, // ✅ Use NET profit
         profitRate: totalCost > 0 ? netProfit / (totalCost + totalFees) : 0,
+        expectedPrice: 1,                          // Settlement at $1 (no price uncertainty)
+        slippagePercent: 0,                        // No slippage on settlement
         marketName: this.market.name,
         conditionId: this.market.conditionId,
         timestamp: Date.now(),
@@ -3602,6 +3938,8 @@ export class DipArbService extends EventEmitter {
         cost: totalReceived,
         profit: netProfit, // ✅ Use NET profit
         profitRate: totalCost > 0 ? netProfit / (totalCost + totalFees) : 0,
+        expectedPrice: 1,                          // Expected sell price before slippage
+        slippagePercent: 0.01,                     // 1% simulated slippage on sell
         marketName: this.market.name,
         conditionId: this.market.conditionId,
         timestamp: Date.now(),

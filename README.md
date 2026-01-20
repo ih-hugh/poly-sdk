@@ -15,25 +15,41 @@
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Installation](#installation)
-- [Architecture](#architecture)
-- [Quick Start](#quick-start)
-- [Services Guide](#services-guide)
-  - [PolymarketSDK (Entry Point)](#polymarketsdk-entry-point)
-  - [TradingService](#tradingservice)
-  - [MarketService](#marketservice)
-  - [OnchainService](#onchainservice)
-  - [RealtimeServiceV2](#realtimeservicev2)
-  - [WalletService](#walletservice)
-  - [SmartMoneyService](#smartmoneyservice)
-  - [ArbitrageService](#arbitrageservice)
-  - [DipArbService](#diparbservice)
-- [Low-Level Clients](#low-level-clients)
-- [Breaking Changes (v0.3.0)](#breaking-changes-v030)
-- [Examples](#examples)
-- [API Reference](#api-reference)
-- [License](#license)
+- [@catalyst-team/poly-sdk](#catalyst-teampoly-sdk)
+  - [Table of Contents](#table-of-contents)
+  - [Overview](#overview)
+    - [Key Features](#key-features)
+  - [Installation](#installation)
+  - [Architecture](#architecture)
+    - [Service Responsibilities](#service-responsibilities)
+  - [Quick Start](#quick-start)
+    - [Basic Usage (Read-Only)](#basic-usage-read-only)
+    - [With Authentication (Trading)](#with-authentication-trading)
+  - [Services Guide](#services-guide)
+    - [PolymarketSDK (Entry Point)](#polymarketsdk-entry-point)
+    - [TradingService](#tradingservice)
+    - [MarketService](#marketservice)
+      - [Understanding Polymarket Orderbook](#understanding-polymarket-orderbook)
+    - [OnchainService](#onchainservice)
+    - [RealtimeServiceV2](#realtimeservicev2)
+    - [WalletService](#walletservice)
+    - [SmartMoneyService](#smartmoneyservice)
+    - [ArbitrageService](#arbitrageservice)
+    - [DipArbService](#diparbservice)
+      - [Quick Start](#quick-start-1)
+      - [Features](#features)
+      - [Programmatic Usage](#programmatic-usage)
+      - [Events](#events)
+      - [Scripts](#scripts)
+  - [Low-Level Clients](#low-level-clients)
+  - [Breaking Changes (v0.3.0)](#breaking-changes-v030)
+    - [`UnifiedMarket.tokens` is now an Array](#unifiedmarkettokens-is-now-an-array)
+    - [Migration Guide](#migration-guide)
+  - [Examples](#examples)
+  - [API Reference](#api-reference)
+    - [Type Exports](#type-exports)
+  - [Dependencies](#dependencies)
+  - [License](#license)
 
 ---
 
@@ -83,11 +99,11 @@ poly-sdk Architecture
 ================================================================================
 
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│                              PolymarketSDK                                    │
-│                            (Entry Point)                                      │
+│                              PolymarketSDK                                   │
+│                            (Entry Point)                                     │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
-│  Layer 3: High-Level Services (Recommended)                                   │
+│                                                                              │
+│  Layer 3: High-Level Services (Recommended)                                  │
 │  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                      │
 │  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐                 │
 │  │  TradingService │ │  MarketService  │ │ OnchainService  │                 │
@@ -97,7 +113,7 @@ poly-sdk Architecture
 │  │  • Order mgmt   │ │  • Price history│ │ • Approvals     │                 │
 │  │  • Rewards      │ │  • Arbitrage    │ │ • Swaps         │                 │
 │  └─────────────────┘ └─────────────────┘ └─────────────────┘                 │
-│                                                                               │
+│                                                                              │
 │  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐                 │
 │  │RealtimeServiceV2│ │  WalletService  │ │SmartMoneyService│                 │
 │  │  ────────────── │ │  ────────────── │ │ ──────────────  │                 │
@@ -106,46 +122,46 @@ poly-sdk Architecture
 │  │  • Book updates │ │  • Sell detect  │ │ • Signal detect │                 │
 │  │  • User events  │ │  • PnL calc     │ │ • Leaderboard   │                 │
 │  └─────────────────┘ └─────────────────┘ └─────────────────┘                 │
-│                                                                               │
+│                                                                              │
 │  ┌─────────────────────────────────────────────────────────────────────────┐ │
-│  │                        ArbitrageService                                  │ │
+│  │                        ArbitrageService                                 │ │
 │  │  ─────────────────────────────────────────────────────────────────────  │ │
 │  │  • Market scanning  • Auto execution  • Rebalancer  • Smart clearing    │ │
 │  └─────────────────────────────────────────────────────────────────────────┘ │
-│                                                                               │
+│                                                                              │
 │  ┌─────────────────────────────────────────────────────────────────────────┐ │
-│  │                         DipArbService                                    │ │
+│  │                         DipArbService                                   │ │
 │  │  ─────────────────────────────────────────────────────────────────────  │ │
 │  │  • 15m crypto UP/DOWN  • Dip detection  • Auto-rotate  • Background redeem│
 │  └─────────────────────────────────────────────────────────────────────────┘ │
-│                                                                               │
+│                                                                              │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
+│                                                                              │
 │  Layer 2: Low-Level Clients (Advanced Users / Raw API Access)                │
 │  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                       │
-│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐ │
-│  │GammaApiClnt│ │DataApiClnt │ │SubgraphClnt│ │ CTFClient  │ │BridgeClient│ │
-│  │ ────────── │ │ ────────── │ │ ────────── │ │ ────────── │ │ ────────── │ │
-│  │ • Markets  │ │ • Positions│ │ • On-chain │ │ • Split    │ │ • Cross-   │ │
-│  │ • Events   │ │ • Trades   │ │ • PnL      │ │ • Merge    │ │   chain    │ │
-│  │ • Search   │ │ • Activity │ │ • OI       │ │ • Redeem   │ │ • Deposits │ │
-│  └────────────┘ └────────────┘ └────────────┘ └────────────┘ └────────────┘ │
-│                                                                               │
+│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐  │
+│  │GammaApiClnt│ │DataApiClnt │ │SubgraphClnt│ │ CTFClient  │ │BridgeClient│  │
+│  │ ────────── │ │ ────────── │ │ ────────── │ │ ────────── │ │ ────────── │  │
+│  │ • Markets  │ │ • Positions│ │ • On-chain │ │ • Split    │ │ • Cross-   │  │
+│  │ • Events   │ │ • Trades   │ │ • PnL      │ │ • Merge    │ │   chain    │  │
+│  │ • Search   │ │ • Activity │ │ • OI       │ │ • Redeem   │ │ • Deposits │  │
+│  └────────────┘ └────────────┘ └────────────┘ └────────────┘ └────────────┘  │
+│                                                                              │
 │  Uses Official Polymarket Clients:                                           │
 │  • @polymarket/clob-client - Trading, orderbook, market data                 │
 │  • @polymarket/real-time-data-client - WebSocket real-time updates           │
-│                                                                               │
+│                                                                              │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
+│                                                                              │
 │  Layer 1: Core Infrastructure                                                │
 │  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                                │
-│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐ │
-│  │RateLimiter │ │   Cache    │ │   Errors   │ │   Types    │ │Price Utils │ │
-│  │ ────────── │ │ ────────── │ │ ────────── │ │ ────────── │ │ ────────── │ │
-│  │ • Per-API  │ │ • TTL-based│ │ • Retry    │ │ • Unified  │ │ • Arb calc │ │
-│  │ • Bottleneck│ │ • Pluggable│ │ • Codes    │ │ • K-lines  │ │ • Rounding │ │
-│  └────────────┘ └────────────┘ └────────────┘ └────────────┘ └────────────┘ │
-│                                                                               │
+│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐  │
+│  │RateLimiter │ │   Cache    │ │   Errors   │ │   Types    │ │Price Utils │  │
+│  │ ────────── │ │ ────────── │ │ ────────── │ │ ────────── │ │ ────────── │  │
+│  │ • Per-API  │ │ • TTL-based│ │ • Retry    │ │ • Unified  │ │ • Arb calc │  │
+│  │ • Bottleneck││ • Pluggable│ │ • Codes    │ │ • K-lines  │ │ • Rounding │  │
+│  └────────────┘ └────────────┘ └────────────┘ └────────────┘ └────────────┘  │
+│                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
