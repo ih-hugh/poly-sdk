@@ -6,9 +6,39 @@
 import { RateLimiter, ApiType } from '../core/rate-limiter.js';
 import type { UnifiedCache } from '../core/unified-cache.js';
 import { CACHE_TTL } from '../core/unified-cache.js';
-import { PolymarketError } from '../core/errors.js';
+import { PolymarketError, ErrorCode } from '../core/errors.js';
 
 const DATA_API_BASE = 'https://data-api.polymarket.com';
+
+// Default timeout for fetch requests (30 seconds)
+const DEFAULT_FETCH_TIMEOUT_MS = 30000;
+
+/**
+ * Fetch with timeout protection using AbortController
+ * Prevents hung requests from blocking rate limiter queues indefinitely
+ */
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new PolymarketError(
+        ErrorCode.TIMEOUT,
+        `Request timed out after ${timeoutMs}ms: ${url}`,
+        true // retryable
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 // ===== Types =====
 
@@ -436,7 +466,7 @@ export class DataApiClient {
       if (params?.mergeable !== undefined) query.set('mergeable', String(params.mergeable));
       if (params?.title) query.set('title', params.title);
 
-      const response = await fetch(`${DATA_API_BASE}/positions?${query}`);
+      const response = await fetchWithTimeout(`${DATA_API_BASE}/positions?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -487,7 +517,7 @@ export class DataApiClient {
       if (params?.sortBy) query.set('sortBy', params.sortBy);
       if (params?.sortDirection) query.set('sortDirection', params.sortDirection);
 
-      const response = await fetch(`${DATA_API_BASE}/closed-positions?${query}`);
+      const response = await fetchWithTimeout(`${DATA_API_BASE}/closed-positions?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -546,7 +576,7 @@ export class DataApiClient {
       if (params?.sortBy) query.set('sortBy', params.sortBy);
       if (params?.sortDirection) query.set('sortDirection', params.sortDirection);
 
-      const response = await fetch(`${DATA_API_BASE}/activity?${query}`);
+      const response = await fetchWithTimeout(`${DATA_API_BASE}/activity?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -648,7 +678,7 @@ export class DataApiClient {
       if (params?.filterType) query.set('filterType', params.filterType);
       if (params?.filterAmount !== undefined) query.set('filterAmount', String(params.filterAmount));
 
-      const response = await fetch(`${DATA_API_BASE}/trades?${query}`);
+      const response = await fetchWithTimeout(`${DATA_API_BASE}/trades?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -762,7 +792,7 @@ export class DataApiClient {
       if (userName) query.set('userName', userName);
 
       return this.rateLimiter.execute(ApiType.DATA_API, async () => {
-        const response = await fetch(
+        const response = await fetchWithTimeout(
           `${DATA_API_BASE}/v1/leaderboard?${query}`
         );
         if (!response.ok)
@@ -822,7 +852,7 @@ export class DataApiClient {
         markets.forEach((m) => query.append('market', m));
       }
 
-      const response = await fetch(`${DATA_API_BASE}/value?${query}`);
+      const response = await fetchWithTimeout(`${DATA_API_BASE}/value?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -862,7 +892,7 @@ export class DataApiClient {
       const query = new URLSearchParams({ market: params.market });
       if (params.limit !== undefined) query.set('limit', String(params.limit));
 
-      const response = await fetch(`${DATA_API_BASE}/holders?${query}`);
+      const response = await fetchWithTimeout(`${DATA_API_BASE}/holders?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,

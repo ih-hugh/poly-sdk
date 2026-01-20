@@ -36,10 +36,40 @@
 
 import { RateLimiter, ApiType } from '../core/rate-limiter.js';
 import type { UnifiedCache } from '../core/unified-cache.js';
-import { PolymarketError } from '../core/errors.js';
+import { PolymarketError, ErrorCode } from '../core/errors.js';
 
 /** Gamma API base URL */
 const GAMMA_API_BASE = 'https://gamma-api.polymarket.com';
+
+// Default timeout for fetch requests (30 seconds)
+const DEFAULT_FETCH_TIMEOUT_MS = 30000;
+
+/**
+ * Fetch with timeout protection using AbortController
+ * Prevents hung requests from blocking rate limiter queues indefinitely
+ */
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new PolymarketError(
+        ErrorCode.TIMEOUT,
+        `Request timed out after ${timeoutMs}ms: ${url}`,
+        true // retryable
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 // ===== Types =====
 
@@ -385,7 +415,7 @@ export class GammaApiClient {
     if (params?.tag) query.set('tag', params.tag);
 
     return this.rateLimiter.execute(ApiType.GAMMA_API, async () => {
-      const response = await fetch(`${GAMMA_API_BASE}/markets?${query}`);
+      const response = await fetchWithTimeout(`${GAMMA_API_BASE}/markets?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -466,7 +496,7 @@ export class GammaApiClient {
     if (params?.limit) query.set('limit', String(params.limit));
 
     return this.rateLimiter.execute(ApiType.GAMMA_API, async () => {
-      const response = await fetch(`${GAMMA_API_BASE}/events?${query}`);
+      const response = await fetchWithTimeout(`${GAMMA_API_BASE}/events?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -510,7 +540,7 @@ export class GammaApiClient {
    */
   async getEventById(id: string): Promise<GammaEvent | null> {
     return this.rateLimiter.execute(ApiType.GAMMA_API, async () => {
-      const response = await fetch(`${GAMMA_API_BASE}/events/${id}`);
+      const response = await fetchWithTimeout(`${GAMMA_API_BASE}/events/${id}`);
       if (!response.ok) {
         if (response.status === 404) return null;
         throw PolymarketError.fromHttpError(
