@@ -25,7 +25,7 @@ import {
   type MarketSubscription,
   type OrderbookSnapshot,
 } from './realtime-service-v2.js';
-import { TradingService } from './trading-service.js';
+import { TradingService, type OrderResult } from './trading-service.js';
 import { MarketService } from './market-service.js';
 import { CTFClient, type TokenIds } from '../clients/ctf-client.js';
 import { GammaApiClient } from '../clients/gamma-api.js';
@@ -1404,6 +1404,54 @@ export class ArbitrageService extends EventEmitter {
     }
   }
 
+  /**
+   * Verify that a FOK order was actually fully filled
+   * CLOB API sometimes accepts FOK orders that don't fully fill
+   * @returns true if order is fully filled, false if still open/partial
+   */
+  private async verifyOrderFill(
+    orderResult: OrderResult,
+    _tokenId: string, // Reserved for future filtering by token
+    tokenLabel: string
+  ): Promise<{ filled: boolean; reason?: string }> {
+    if (!this.tradingService || !orderResult.success) {
+      return { filled: false, reason: 'Order not successful' };
+    }
+
+    // If no order ID, we can't verify - assume filled based on success flag
+    const orderId = orderResult.orderId || orderResult.orderIds?.[0];
+    if (!orderId) {
+      this.log(`     ⚠️ No order ID for ${tokenLabel} - cannot verify fill status`);
+      return { filled: true }; // Optimistically assume filled if no ID to check
+    }
+
+    try {
+      // Small delay to allow CLOB state to settle
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // Query open orders to see if this order is still there
+      const openOrders = await this.tradingService.getOpenOrders();
+      const stillOpen = openOrders.find(o => o.id === orderId);
+
+      if (stillOpen) {
+        const fillPercent = stillOpen.originalSize > 0
+          ? ((stillOpen.filledSize / stillOpen.originalSize) * 100).toFixed(1)
+          : '0';
+        this.log(`     ❌ ${tokenLabel} order ${orderId} still open: ${fillPercent}% filled (${stillOpen.filledSize}/${stillOpen.originalSize})`);
+        return {
+          filled: false,
+          reason: `Order partially filled: ${fillPercent}% (${stillOpen.filledSize}/${stillOpen.originalSize} shares)`
+        };
+      }
+
+      return { filled: true };
+    } catch (error: any) {
+      this.log(`     ⚠️ Failed to verify ${tokenLabel} fill: ${error.message}`);
+      // On verification error, assume filled to avoid blocking (optimistic)
+      return { filled: true };
+    }
+  }
+
   private async updateBalance(): Promise<void> {
     if (!this.ctf || !this.market) return;
 
@@ -1488,6 +1536,32 @@ export class ArbitrageService extends EventEmitter {
           profit: 0,
           txHashes,
           error: `Order(s) failed: YES=${buyYesResult.errorMsg}, NO=${buyNoResult.errorMsg}`,
+          executionTimeMs: Date.now() - startTime,
+        };
+      }
+
+      // Verify FOK orders were actually fully filled (CLOB can accept partial FOK)
+      this.log(`     Verifying order fills...`);
+      const [yesVerify, noVerify] = await Promise.all([
+        this.verifyOrderFill(buyYesResult, this.market!.yesTokenId, outcomes[0]),
+        this.verifyOrderFill(buyNoResult, this.market!.noTokenId, outcomes[1]),
+      ]);
+
+      if (!yesVerify.filled || !noVerify.filled) {
+        const failedSides: string[] = [];
+        if (!yesVerify.filled) failedSides.push(`${outcomes[0]}: ${yesVerify.reason}`);
+        if (!noVerify.filled) failedSides.push(`${outcomes[1]}: ${noVerify.reason}`);
+
+        this.log(`  ⚠️ FOK order(s) not fully filled - triggering imbalance handler`);
+        await this.fixImbalanceIfNeeded();
+
+        return {
+          success: false,
+          type: 'long',
+          size,
+          profit: 0,
+          txHashes,
+          error: `FOK order verification failed: ${failedSides.join(', ')}`,
           executionTimeMs: Date.now() - startTime,
         };
       }
@@ -1619,6 +1693,32 @@ export class ArbitrageService extends EventEmitter {
           profit: 0,
           txHashes,
           error: `Order(s) failed: YES=${sellYesResult.errorMsg}, NO=${sellNoResult.errorMsg}`,
+          executionTimeMs: Date.now() - startTime,
+        };
+      }
+
+      // Verify FOK orders were actually fully filled (CLOB can accept partial FOK)
+      this.log(`     Verifying order fills...`);
+      const [yesVerify, noVerify] = await Promise.all([
+        this.verifyOrderFill(sellYesResult, this.market!.yesTokenId, outcomes[0]),
+        this.verifyOrderFill(sellNoResult, this.market!.noTokenId, outcomes[1]),
+      ]);
+
+      if (!yesVerify.filled || !noVerify.filled) {
+        const failedSides: string[] = [];
+        if (!yesVerify.filled) failedSides.push(`${outcomes[0]}: ${yesVerify.reason}`);
+        if (!noVerify.filled) failedSides.push(`${outcomes[1]}: ${noVerify.reason}`);
+
+        this.log(`  ⚠️ FOK order(s) not fully filled - triggering imbalance handler`);
+        await this.fixImbalanceIfNeeded();
+
+        return {
+          success: false,
+          type: 'short',
+          size,
+          profit: 0,
+          txHashes,
+          error: `FOK order verification failed: ${failedSides.join(', ')}`,
           executionTimeMs: Date.now() - startTime,
         };
       }
