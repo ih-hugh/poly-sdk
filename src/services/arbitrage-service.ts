@@ -41,6 +41,15 @@ import {
 } from '../utils/price-utils.js';
 import type { BookUpdate } from '../core/types.js';
 
+// ===== Constants =====
+
+/**
+ * Default maximum slippage percentage for market orders.
+ * This prevents execution at prices significantly worse than expected.
+ * 2% (0.02) provides reasonable protection while allowing normal market movements.
+ */
+export const DEFAULT_MAX_SLIPPAGE_PERCENT = 0.02;
+
 // ===== Types =====
 
 export interface ArbitrageMarketConfig {
@@ -781,10 +790,14 @@ export class ArbitrageService extends EventEmitter {
           break;
         }
         case 'sell_yes': {
+          // Get current YES bid price for slippage protection
+          const yesBidPrice = this.orderbook.yesBids[0]?.price;
           const result = await this.tradingService.createMarketOrder({
             tokenId: this.market.yesTokenId,
             side: 'SELL',
             amount: rebalanceAction.amount,
+            price: yesBidPrice,
+            maxSlippagePercent: DEFAULT_MAX_SLIPPAGE_PERCENT,
             orderType: 'FOK',
           });
           if (!result.success) {
@@ -794,10 +807,14 @@ export class ArbitrageService extends EventEmitter {
           break;
         }
         case 'sell_no': {
+          // Get current NO bid price for slippage protection
+          const noBidPrice = this.orderbook.noBids[0]?.price;
           const result = await this.tradingService.createMarketOrder({
             tokenId: this.market.noTokenId,
             side: 'SELL',
             amount: rebalanceAction.amount,
+            price: noBidPrice,
+            maxSlippagePercent: DEFAULT_MAX_SLIPPAGE_PERCENT,
             orderType: 'FOK',
           });
           if (!result.success) {
@@ -1179,6 +1196,9 @@ export class ArbitrageService extends EventEmitter {
       }
 
       // Step 2: Sell unpaired tokens
+      // Note: For clearPositions, we don't have live orderbook data, so we use
+      // a conservative estimate of 0.5 as the base price for slippage protection
+      const estimatedPrice = 0.5;
       if (this.tradingService && unpairedYes >= this.config.minTradeSize) {
         try {
           const sellAmount = Math.floor(unpairedYes * 1e6) / 1e6;
@@ -1186,11 +1206,13 @@ export class ArbitrageService extends EventEmitter {
             tokenId: market.yesTokenId,
             side: 'SELL',
             amount: sellAmount,
+            price: estimatedPrice,
+            maxSlippagePercent: DEFAULT_MAX_SLIPPAGE_PERCENT,
             orderType: 'FOK',
           });
           if (result.success) {
             // Estimate USDC received (conservative estimate since we don't have exact trade info)
-            const usdcReceived = sellAmount * 0.5; // Assume ~0.5 average price
+            const usdcReceived = sellAmount * estimatedPrice;
             actions.push({
               type: 'sell_yes',
               amount: sellAmount,
@@ -1221,11 +1243,13 @@ export class ArbitrageService extends EventEmitter {
             tokenId: market.noTokenId,
             side: 'SELL',
             amount: sellAmount,
+            price: estimatedPrice,
+            maxSlippagePercent: DEFAULT_MAX_SLIPPAGE_PERCENT,
             orderType: 'FOK',
           });
           if (result.success) {
             // Estimate USDC received (conservative estimate since we don't have exact trade info)
-            const usdcReceived = sellAmount * 0.5; // Assume ~0.5 average price
+            const usdcReceived = sellAmount * estimatedPrice;
             actions.push({
               type: 'sell_no',
               amount: sellAmount,
@@ -1377,22 +1401,28 @@ export class ArbitrageService extends EventEmitter {
 
     try {
       if (imbalance > 0) {
-        // Sell excess YES
+        // Sell excess YES - use current bid price for slippage protection
+        const yesBidPrice = this.orderbook.yesBids[0]?.price;
         const result = await this.tradingService.createMarketOrder({
           tokenId: this.market.yesTokenId,
           side: 'SELL',
           amount: sellAmount,
+          price: yesBidPrice,
+          maxSlippagePercent: DEFAULT_MAX_SLIPPAGE_PERCENT,
           orderType: 'FOK',
         });
         if (result.success) {
           this.log(`   ✅ Sold ${sellAmount.toFixed(2)} excess YES to restore balance`);
         }
       } else {
-        // Sell excess NO
+        // Sell excess NO - use current bid price for slippage protection
+        const noBidPrice = this.orderbook.noBids[0]?.price;
         const result = await this.tradingService.createMarketOrder({
           tokenId: this.market.noTokenId,
           side: 'SELL',
           amount: sellAmount,
+          price: noBidPrice,
+          maxSlippagePercent: DEFAULT_MAX_SLIPPAGE_PERCENT,
           orderType: 'FOK',
         });
         if (result.success) {
@@ -1502,19 +1532,24 @@ export class ArbitrageService extends EventEmitter {
         };
       }
 
-      // Buy both tokens in parallel
+      // Buy both tokens in parallel with slippage protection
+      // Use ask prices from opportunity for BUY orders
       this.log(`  1. Buying tokens in parallel...`);
       const [buyYesResult, buyNoResult] = await Promise.all([
         this.tradingService!.createMarketOrder({
           tokenId: this.market!.yesTokenId,
           side: 'BUY',
           amount: size * buyYes,
+          price: buyYes,
+          maxSlippagePercent: DEFAULT_MAX_SLIPPAGE_PERCENT,
           orderType: 'FOK',
         }),
         this.tradingService!.createMarketOrder({
           tokenId: this.market!.noTokenId,
           side: 'BUY',
           amount: size * buyNo,
+          price: buyNo,
+          maxSlippagePercent: DEFAULT_MAX_SLIPPAGE_PERCENT,
           orderType: 'FOK',
         }),
       ]);
@@ -1657,19 +1692,25 @@ export class ArbitrageService extends EventEmitter {
         };
       }
 
-      // Sell both tokens in parallel
+      // Sell both tokens in parallel with slippage protection
+      // Use bid prices from opportunity for SELL orders
+      const { sellYes, sellNo } = opportunity.effectivePrices;
       this.log(`  1. Selling pre-held tokens in parallel...`);
       const [sellYesResult, sellNoResult] = await Promise.all([
         this.tradingService!.createMarketOrder({
           tokenId: this.market!.yesTokenId,
           side: 'SELL',
           amount: size,
+          price: sellYes,
+          maxSlippagePercent: DEFAULT_MAX_SLIPPAGE_PERCENT,
           orderType: 'FOK',
         }),
         this.tradingService!.createMarketOrder({
           tokenId: this.market!.noTokenId,
           side: 'SELL',
           amount: size,
+          price: sellNo,
+          maxSlippagePercent: DEFAULT_MAX_SLIPPAGE_PERCENT,
           orderType: 'FOK',
         }),
       ]);

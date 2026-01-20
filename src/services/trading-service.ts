@@ -90,8 +90,17 @@ export interface MarketOrderParams {
   tokenId: string;
   side: Side;
   amount: number;
+  /** Current market price - used for slippage calculation if maxSlippagePercent is set */
   price?: number;
   orderType?: 'FOK' | 'FAK';
+  /**
+   * Maximum slippage percentage (0.02 = 2%).
+   * When set, calculates a limit price to prevent execution at unfavorable prices:
+   * - BUY: limitPrice = currentPrice * (1 + maxSlippagePercent)
+   * - SELL: limitPrice = currentPrice * (1 - maxSlippagePercent)
+   * Requires `price` to be set for slippage calculation.
+   */
+  maxSlippagePercent?: number;
 }
 
 export interface Order {
@@ -356,6 +365,12 @@ export class TradingService {
    * - Minimum size: 5 shares (MIN_ORDER_SIZE_SHARES)
    *
    * Market orders below these limits will be rejected by the API.
+   *
+   * Slippage Protection:
+   * When `maxSlippagePercent` is provided along with `price`, a limit price is calculated:
+   * - BUY: limitPrice = price * (1 + maxSlippagePercent)
+   * - SELL: limitPrice = price * (1 - maxSlippagePercent)
+   * This prevents execution at prices worse than the slippage-adjusted limit.
    */
   async createMarketOrder(params: MarketOrderParams): Promise<OrderResult> {
     // Validate minimum order value before sending to API
@@ -378,6 +393,22 @@ export class TradingService {
       }
     }
 
+    // Calculate slippage-adjusted limit price if slippage protection is enabled
+    let limitPrice = params.price;
+    if (params.maxSlippagePercent !== undefined && params.price !== undefined && params.price > 0) {
+      if (params.side === 'BUY') {
+        // For buys, limit price is higher (willing to pay up to this amount)
+        limitPrice = params.price * (1 + params.maxSlippagePercent);
+        // Cap at 1.0 (maximum valid price for outcome tokens)
+        limitPrice = Math.min(limitPrice, 1.0);
+      } else {
+        // For sells, limit price is lower (willing to accept down to this amount)
+        limitPrice = params.price * (1 - params.maxSlippagePercent);
+        // Floor at 0.01 (minimum valid price)
+        limitPrice = Math.max(limitPrice, 0.01);
+      }
+    }
+
     const client = await this.ensureInitialized();
 
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
@@ -394,7 +425,7 @@ export class TradingService {
             tokenID: params.tokenId,
             side: params.side === 'BUY' ? ClobSide.BUY : ClobSide.SELL,
             amount: params.amount,
-            price: params.price,
+            price: limitPrice,
           },
           { tickSize, negRisk },
           orderType
