@@ -287,15 +287,15 @@ export const DIP_ARB_CRYPTO_TAKER_FEE = 0.03;
  */
 export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
   shares: 50,             // ⚡ Increased from 20 for more capital deployment
-  sumTarget: 0.92,        // ⚡ FIXED: ~8% gross = ~2% net after 6% fees (was 1.05 = guaranteed loss!)
-  dipThreshold: 0.01,     // ⚡ LOWERED: 1% dip threshold catches more opportunities
+  sumTarget: 0.88,        // ⚡ AGGRESSIVE: ~12% gross = ~1.5% net after 6% fees (wider entry window)
+  dipThreshold: 0.025,    // ⚡ AGGRESSIVE: 2.5% dip threshold catches momentum shifts
   windowMinutes: 15,      // ⚡ Full market duration (was 10)
   slidingWindowMs: 2000,  // ⚡ LOWERED: 2 seconds for faster detection (was 3000)
   maxSlippage: 0.02,
   minProfitRate: 0.02,    // ⚡ FIXED: Require 2% net profit minimum (was 0 = no check)
-  leg2TimeoutSeconds: 60, // ⚡ LOWERED: 60s timeout for faster rotation
+  leg2TimeoutSeconds: 180, // ⚡ AGGRESSIVE: 3min timeout reduces bleed from timeouts
   enableSurge: true,
-  surgeThreshold: 0.01,   // ⚡ Match dipThreshold (1%)
+  surgeThreshold: 0.025,  // ⚡ Match dipThreshold (2.5%)
   autoMerge: true,
   autoExecute: true,      // ✅ MUST be true to actually trade!
   executionCooldown: 500, // ⚡ FIX #4: Reduced from 2000ms for faster Leg2 execution
