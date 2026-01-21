@@ -517,12 +517,27 @@ export class DipArbManager extends EventEmitter {
 
     // Forward paper trades with market context
     service.on('paperTrade', (trade) => {
-      this.emit('paperTrade', {
-        ...trade,
+      // Explicit field mapping to ensure no data is lost
+      const activeMarket = this.activeMarkets.get(coin);
+      const paperTradeEvent = {
+        type: trade.type,
+        side: trade.side,
+        shares: trade.shares,
+        price: trade.price,
+        cost: trade.cost,
+        totalCost: trade.totalCost,
+        profit: trade.profit,
+        profitRate: trade.profitRate,
+        expectedPrice: trade.expectedPrice,
+        slippagePercent: trade.slippagePercent,
+        marketName: trade.marketName ?? activeMarket?.market.name,
+        conditionId: trade.conditionId ?? activeMarket?.conditionId,
+        timestamp: trade.timestamp ?? Date.now(),
         coin,
-        marketConditionId: this.activeMarkets.get(coin)?.conditionId,
-        marketName: this.activeMarkets.get(coin)?.market.name,
-      });
+        marketConditionId: activeMarket?.conditionId,
+      };
+      this.log(`[${coin}] Forwarding paperTrade: type=${paperTradeEvent.type}, side=${paperTradeEvent.side}, shares=${paperTradeEvent.shares}, price=${paperTradeEvent.price}`);
+      this.emit('paperTrade', paperTradeEvent);
     });
 
     // Forward round events with market context
