@@ -249,6 +249,7 @@ export type {
   DipArbManagerConfig,
   ActiveMarket,
   MarketStatus,
+  CoinSpecificConfig,
 } from './services/dip-arb-manager.js';
 
 // SportsMarketScanner - Sports market discovery and arbitrage scanning

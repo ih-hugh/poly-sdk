@@ -138,6 +138,25 @@ export interface DipArbServiceConfig {
   maxOppositeSideSpread?: number;
 
   /**
+   * Maximum required Leg2 price drop percentage for entry
+   *
+   * When the opposite side price is too high relative to sumTarget,
+   * it would need to drop significantly for Leg2 to be profitable.
+   * This prevents entering positions where Leg2 is mathematically unlikely.
+   *
+   * Example: If buying UP at $0.21, DOWN is at $0.79, and sumTarget is $0.88:
+   * - Max Leg2 price: $0.88 - $0.21 = $0.67
+   * - Required drop: $0.79 - $0.67 = $0.12 (15.2% of $0.79)
+   * - If maxRequiredLeg2Drop is 0.15 (15%), this entry is rejected
+   *
+   * Lower values = stricter filtering (fewer entries, higher quality)
+   * Higher values = more permissive (more entries, some may timeout)
+   *
+   * @default 0.15 (15% - requires opposite side to drop max 15%)
+   */
+  maxRequiredLeg2Drop?: number;
+
+  /**
    * Minimum price allowed for dip side entry
    * Prevents buying nearly-resolved tokens (e.g., $0.005) which are lottery tickets
    * When a token is at $0.005, the market has essentially resolved
@@ -319,6 +338,8 @@ export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
   maxOppositeSideSpread: 0.05,          // ✅ Max 5% spread on opposite side
   minDipSidePrice: 0.03,                // ⚡ LOWERED: 0.03 to include more markets
   maxOpenPositions: 25,                 // ⚡ INCREASED: 25 concurrent positions (was 10)
+  // Leg2 feasibility check - prevents entering polarized markets
+  maxRequiredLeg2Drop: 0.15,            // ⚡ NEW: Max 15% drop required for Leg2 profitability
 };
 
 // ============= Market Configuration =============

@@ -33,6 +33,12 @@ export interface RealtimeServiceConfig {
   pingInterval?: number;
   /** Enable debug logging (default: false) */
   debug?: boolean;
+  /** Maximum reconnection attempts before giving up (default: 10) */
+  maxReconnectAttempts?: number;
+  /** Initial reconnection delay in ms (default: 1000) */
+  initialReconnectDelay?: number;
+  /** Maximum reconnection delay in ms (default: 30000) */
+  maxReconnectDelay?: number;
 }
 
 // Market data types
@@ -254,7 +260,7 @@ export interface EquityPriceHandlers {
 
 export class RealtimeServiceV2 extends EventEmitter {
   private client: RealTimeDataClient | null = null;
-  private config: RealtimeServiceConfig;
+  private config: Required<RealtimeServiceConfig>;
   private subscriptions: Map<string, Subscription> = new Map();
   private subscriptionIdCounter = 0;
   private connected = false;
@@ -275,12 +281,21 @@ export class RealtimeServiceV2 extends EventEmitter {
   private bookCache: Map<string, OrderbookSnapshot> = new Map();
   private lastTradeCache: Map<string, LastTradeInfo> = new Map();
 
+  // Reconnection state (to fix memory leak from @polymarket/real-time-data-client)
+  private reconnectAttempts = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private isReconnecting = false;
+  private manualDisconnect = false;
+
   constructor(config: RealtimeServiceConfig = {}) {
     super();
     this.config = {
       autoReconnect: config.autoReconnect ?? true,
       pingInterval: config.pingInterval ?? 5000,
       debug: config.debug ?? false,
+      maxReconnectAttempts: config.maxReconnectAttempts ?? 10,
+      initialReconnectDelay: config.initialReconnectDelay ?? 1000,
+      maxReconnectDelay: config.maxReconnectDelay ?? 30000,
     };
   }
 
@@ -292,16 +307,24 @@ export class RealtimeServiceV2 extends EventEmitter {
    * Connect to WebSocket server
    */
   connect(): this {
-    if (this.client) {
+    if (this.client && !this.isReconnecting) {
       this.log('Already connected or connecting');
       return this;
     }
 
+    // Reset manual disconnect flag when explicitly connecting
+    this.manualDisconnect = false;
+
+    // Clean up any existing client before creating new one (prevents memory leak)
+    this.cleanupClient();
+
+    // IMPORTANT: Disable the library's auto-reconnect - we handle it ourselves
+    // The library's auto-reconnect has a memory leak (creates new WebSocket without cleanup)
     this.client = new RealTimeDataClient({
       onConnect: this.handleConnect.bind(this),
       onMessage: this.handleMessage.bind(this),
       onStatusChange: this.handleStatusChange.bind(this),
-      autoReconnect: this.config.autoReconnect,
+      autoReconnect: false, // DISABLED - we handle reconnection with proper cleanup
       pingInterval: this.config.pingInterval,
     });
 
@@ -313,16 +336,90 @@ export class RealtimeServiceV2 extends EventEmitter {
    * Disconnect from WebSocket server
    */
   disconnect(): void {
+    this.manualDisconnect = true;  // Prevent auto-reconnect
+    this.cancelReconnect();        // Cancel any pending reconnection
+    this.cleanupClient();
+    this.subscriptions.clear();
+    this.subscriptionMessages.clear();  // Clear reconnection list
+    this.pendingSubscriptions = [];      // Clear pending queue
+    this.subscriptionQueue = [];         // Clear rate-limited queue
+    this.isProcessingQueue = false;      // Reset queue processing state
+    this.reconnectAttempts = 0;          // Reset reconnection attempts
+  }
+
+  /**
+   * Clean up the WebSocket client (prevents memory leak)
+   */
+  private cleanupClient(): void {
     if (this.client) {
-      this.client.disconnect();
+      try {
+        // Explicitly disconnect to stop any internal timers
+        this.client.disconnect();
+      } catch {
+        // Ignore errors during cleanup
+      }
       this.client = null;
       this.connected = false;
-      this.subscriptions.clear();
-      this.subscriptionMessages.clear();  // Clear reconnection list
-      this.pendingSubscriptions = [];      // Clear pending queue
-      this.subscriptionQueue = [];         // Clear rate-limited queue
-      this.isProcessingQueue = false;      // Reset queue processing state
     }
+  }
+
+  /**
+   * Cancel any pending reconnection attempt
+   */
+  private cancelReconnect(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.isReconnecting = false;
+  }
+
+  /**
+   * Schedule a reconnection with exponential backoff
+   */
+  private scheduleReconnect(): void {
+    // Don't reconnect if manually disconnected or already reconnecting
+    if (this.manualDisconnect || this.isReconnecting) {
+      return;
+    }
+
+    // Check if we've exceeded max attempts
+    if (this.reconnectAttempts >= this.config.maxReconnectAttempts) {
+      this.log(`Max reconnection attempts (${this.config.maxReconnectAttempts}) exceeded, giving up`);
+      this.emit('reconnectFailed', {
+        attempts: this.reconnectAttempts,
+        message: 'Max reconnection attempts exceeded',
+      });
+      return;
+    }
+
+    this.isReconnecting = true;
+    this.reconnectAttempts++;
+
+    // Calculate backoff delay with exponential increase + jitter
+    const baseDelay = this.config.initialReconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+    const jitter = Math.random() * 1000; // Add up to 1 second of jitter
+    const delay = Math.min(baseDelay + jitter, this.config.maxReconnectDelay);
+
+    this.log(`Scheduling reconnection attempt ${this.reconnectAttempts}/${this.config.maxReconnectAttempts} in ${Math.round(delay)}ms`);
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.isReconnecting = false;
+
+      if (!this.manualDisconnect) {
+        this.log(`Attempting reconnection (attempt ${this.reconnectAttempts})`);
+        this.connect();
+      }
+    }, delay);
+  }
+
+  /**
+   * Reset reconnection state after successful connection
+   */
+  private resetReconnectState(): void {
+    this.reconnectAttempts = 0;
+    this.cancelReconnect();
   }
 
   /**
@@ -913,6 +1010,9 @@ export class RealtimeServiceV2 extends EventEmitter {
     this.connected = true;
     this.log('Connected to WebSocket server');
 
+    // Reset reconnection state on successful connection
+    this.resetReconnectState();
+
     // Move pending subscriptions to the rate-limited queue
     if (this.pendingSubscriptions.length > 0) {
       this.log(`Moving ${this.pendingSubscriptions.length} pending subscriptions to queue`);
@@ -942,6 +1042,11 @@ export class RealtimeServiceV2 extends EventEmitter {
     if (status === ConnectionStatus.DISCONNECTED) {
       this.connected = false;
       this.emit('disconnected');
+
+      // Schedule reconnection with exponential backoff (if auto-reconnect is enabled)
+      if (this.config.autoReconnect && !this.manualDisconnect) {
+        this.scheduleReconnect();
+      }
     } else if (status === ConnectionStatus.CONNECTED) {
       this.connected = true;
     }

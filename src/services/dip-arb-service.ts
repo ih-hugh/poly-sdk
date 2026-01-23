@@ -302,6 +302,8 @@ export class DipArbService extends EventEmitter {
       limit = 20,
     } = options;
 
+    console.log(`[DipArbService] scanUpcomingMarkets: coin=${coin}, duration=${duration}`);
+
     try {
       // For 'all' duration, try short-term markets first (legacy behavior)
       // For specific durations, use the new unified scanner
@@ -309,6 +311,8 @@ export class DipArbService extends EventEmitter {
 
       if (duration === 'all' || duration === '5m' || duration === '15m') {
         // Use existing short-term scanner for backwards compatibility
+        console.log(`[DipArbService] Calling marketService.scanCryptoShortTermMarkets...`);
+        const apiStartTime = Date.now();
         gammaMarkets = await this.marketService.scanCryptoShortTermMarkets({
           coin: coin as 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'all',
           duration: duration === 'all' ? 'all' : duration as '5m' | '15m',
@@ -317,8 +321,11 @@ export class DipArbService extends EventEmitter {
           limit,
           sortBy: 'endDate',
         });
+        console.log(`[DipArbService] scanCryptoShortTermMarkets completed in ${Date.now() - apiStartTime}ms, found ${gammaMarkets.length} markets`);
       } else {
         // Use new unified scanner for longer durations (1h, 4h, daily)
+        console.log(`[DipArbService] Calling marketService.scanCryptoMarkets...`);
+        const apiStartTime = Date.now();
         gammaMarkets = await this.marketService.scanCryptoMarkets({
           coin: coin as 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'all',
           duration: duration as '1h' | '4h' | 'daily',
@@ -327,6 +334,7 @@ export class DipArbService extends EventEmitter {
           limit,
           sortBy: 'endDate',
         });
+        console.log(`[DipArbService] scanCryptoMarkets completed in ${Date.now() - apiStartTime}ms, found ${gammaMarkets.length} markets`);
       }
 
       this.log(`scanUpcomingMarkets: marketService returned ${gammaMarkets.length} market(s) for duration=${duration}`);
@@ -391,6 +399,7 @@ export class DipArbService extends EventEmitter {
    */
   async findAndStart(options: DipArbFindAndStartOptions = {}): Promise<DipArbMarketConfig | null> {
     const { coin, preferDuration = '15m' } = options;
+    console.log(`[DipArbService] findAndStart called for coin=${coin}, preferDuration=${preferDuration}`);
 
     // Store preferred duration for upgrade checking
     this.preferredDuration = preferDuration;
@@ -430,13 +439,17 @@ export class DipArbService extends EventEmitter {
         };
 
         this.log(`Scanning for ${duration} markets: coin=${scanOptions.coin}, window=${scanOptions.minMinutesUntilEnd}-${scanOptions.maxMinutesUntilEnd}min`);
+        console.log(`[DipArbService] Scanning for ${duration} markets...`);
 
         // Emit searching event for current duration
         if (duration !== preferDuration) {
           this.emit('searching', { duration, message: `Trying ${duration} markets (${preferDuration} unavailable)...`, isFallback: true, coin });
         }
 
+        console.log(`[DipArbService] Calling scanUpcomingMarkets...`);
+        const scanStartTime = Date.now();
         const markets = await this.scanUpcomingMarkets(scanOptions);
+        console.log(`[DipArbService] scanUpcomingMarkets returned ${markets.length} markets in ${Date.now() - scanStartTime}ms`);
 
         if (markets.length > 0) {
           this.log(`Found ${markets.length} ${duration} market(s): ${markets.map(m => `${m.underlying} (ends ${Math.round((m.endTime.getTime() - Date.now()) / 60000)}min)`).join(', ')}`);
@@ -2931,26 +2944,43 @@ export class DipArbService extends EventEmitter {
     }
 
     // ========================================
-    // FIX #1: Leg2 Feasibility Check
+    // FIX #1: Leg2 Feasibility Check (Enhanced with maxRequiredLeg2Drop)
     // ========================================
-    // Verify that current opposite side price + our Leg1 price would be profitable
-    // This prevents entering Leg1 positions where Leg2 is already unprofitable
+    // Calculate how much the opposite side needs to drop for Leg2 to be profitable
+    // This prevents entering positions in polarized markets where Leg2 is unlikely
+    //
+    // Example: If buying UP at $0.21, DOWN is at $0.79, sumTarget is $0.88:
+    // - Max Leg2 price: $0.88 - $0.21 = $0.67
+    // - Required drop: $0.79 - $0.67 = $0.12 (15.2% of $0.79)
+    // - If maxRequiredLeg2Drop is 0.15 (15%), this entry is rejected
     const bestOppositePrice = oppositeSideAsks[0]?.price ?? 1;
+    const maxLeg2Price = this.config.sumTarget - signal.targetPrice;
+    const requiredDrop = bestOppositePrice - maxLeg2Price;
     const estimatedTotalCost = signal.targetPrice + bestOppositePrice;
 
-    if (estimatedTotalCost > this.config.sumTarget) {
-      if (this.config.debug) {
-        this.log(`❌ Signal rejected: estimated total ${estimatedTotalCost.toFixed(4)} > sumTarget ${this.config.sumTarget} (Leg2 already unprofitable)`);
-        this.log(`   Leg1: ${signal.targetPrice.toFixed(4)}, Opposite: ${bestOppositePrice.toFixed(4)}`);
+    // If requiredDrop > 0, the opposite side needs to drop for Leg2 to work
+    if (requiredDrop > 0) {
+      const requiredDropPercent = requiredDrop / bestOppositePrice;
+      const maxDropThreshold = this.config.maxRequiredLeg2Drop ?? 0.15;
+
+      if (requiredDropPercent > maxDropThreshold) {
+        // Spread is too wide - Leg2 is mathematically unlikely
+        this.log(`❌ Signal rejected: leg2 needs ${(requiredDropPercent * 100).toFixed(1)}% drop (max ${(maxDropThreshold * 100).toFixed(0)}%) - spread too wide`);
+        this.log(`   Leg1: ${signal.targetPrice.toFixed(4)}, Opposite: ${bestOppositePrice.toFixed(4)}, maxLeg2: ${maxLeg2Price.toFixed(4)}`);
+        // FIX #7: Emit signalRejected event
+        this.emit('signalRejected', {
+          reason: 'leg2SpreadTooWide',
+          details: `requires ${(requiredDropPercent * 100).toFixed(1)}% drop > max ${(maxDropThreshold * 100).toFixed(0)}%`,
+          signal,
+          timestamp: Date.now(),
+        });
+        return false;
       }
-      // FIX #7: Emit signalRejected event
-      this.emit('signalRejected', {
-        reason: 'leg2Unprofitable',
-        details: `total ${estimatedTotalCost.toFixed(4)} > target ${this.config.sumTarget}`,
-        signal,
-        timestamp: Date.now(),
-      });
-      return false;
+
+      // Drop required but within threshold - allow entry (market may move)
+      if (this.config.debug) {
+        this.log(`⚠️ Leg2 requires ${(requiredDropPercent * 100).toFixed(1)}% drop (within ${(maxDropThreshold * 100).toFixed(0)}% threshold) - proceeding`);
+      }
     }
 
     // ========================================
@@ -2975,7 +3005,8 @@ export class DipArbService extends EventEmitter {
     if (this.config.debug) {
       this.log(`✅ Leg1 signal validated: ${signal.dipSide} @ ${signal.currentPrice.toFixed(4)}, drop ${(signal.dropPercent * 100).toFixed(1)}%`);
       this.log(`   Opposite side: depth=${totalOppDepth.toFixed(0)} shares, best=${bestOppositePrice.toFixed(4)}`);
-      this.log(`   Estimated total: ${estimatedTotalCost.toFixed(4)}, profit: ${(signal.estimatedProfitRate * 100).toFixed(2)}%`);
+      const dropInfo = requiredDrop > 0 ? `, leg2 needs ${(requiredDrop / bestOppositePrice * 100).toFixed(1)}% drop` : ', leg2 already profitable';
+      this.log(`   Estimated total: ${estimatedTotalCost.toFixed(4)}, profit: ${(signal.estimatedProfitRate * 100).toFixed(2)}%${dropInfo}`);
     }
 
     return true;

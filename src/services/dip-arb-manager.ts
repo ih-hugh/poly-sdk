@@ -27,9 +27,28 @@ import {
 
 // ===== Types =====
 
+/**
+ * Coin-specific configuration overrides
+ * Allows tuning parameters per asset based on market dynamics
+ */
+export interface CoinSpecificConfig {
+  /** Override dipThreshold for this coin */
+  dipThreshold?: number;
+  /** Override sumTarget for this coin */
+  sumTarget?: number;
+  /** Override maxRequiredLeg2Drop for this coin */
+  maxRequiredLeg2Drop?: number;
+  /** Disable trading for this coin */
+  enabled?: boolean;
+  /** Override shares for this coin */
+  shares?: number;
+}
+
 export interface DipArbManagerConfig {
   /** Shared config applied to all markets */
   sharedConfig?: Partial<DipArbServiceConfig>;
+  /** Coin-specific configuration overrides */
+  coinConfigs?: Record<DipArbUnderlying, CoinSpecificConfig>;
   /** Enable debug logging */
   debug?: boolean;
 }
@@ -83,6 +102,7 @@ export class DipArbManager extends EventEmitter {
   // Configuration
   private config: DipArbManagerConfig;
   private sharedServiceConfig: Partial<DipArbServiceConfig> = {};
+  private coinConfigs: Partial<Record<DipArbUnderlying, CoinSpecificConfig>> = {};
 
   // Health monitoring
   private healthCheckInterval: ReturnType<typeof setInterval> | null = null;
@@ -115,6 +135,10 @@ export class DipArbManager extends EventEmitter {
       this.sharedServiceConfig = config.sharedConfig;
     }
 
+    if (config.coinConfigs) {
+      this.coinConfigs = config.coinConfigs;
+    }
+
     this.log('DipArbManager initialized');
   }
 
@@ -138,12 +162,24 @@ export class DipArbManager extends EventEmitter {
       config?: Partial<DipArbServiceConfig>;
     } = {}
   ): Promise<DipArbMarketConfig | null> {
+    console.log(`[DipArbManager] startCoin called for ${coin}`);
+
+    // Check if coin is enabled via coinConfigs
+    const coinConfig = this.coinConfigs[coin];
+    if (coinConfig?.enabled === false) {
+      console.log(`[DipArbManager] ${coin} is disabled via coinConfigs, skipping`);
+      this.log(`${coin} is disabled via coinConfigs, skipping`);
+      return null;
+    }
+
     // Check if already running
     if (this.activeMarkets.has(coin)) {
+      console.log(`[DipArbManager] ${coin} already running, skipping`);
       this.log(`${coin} already running, skipping`);
       return this.activeMarkets.get(coin)!.market;
     }
 
+    console.log(`[DipArbManager] Starting ${coin}...`);
     this.log(`Starting ${coin}...`);
 
     // Create a NEW RealtimeServiceV2 for each coin to avoid Polymarket's
@@ -160,12 +196,15 @@ export class DipArbManager extends EventEmitter {
       this.binanceService ?? undefined
     );
 
-    // Apply shared config + per-market overrides
-    // Note: debug comes from sharedServiceConfig (set via updateSharedConfig) or options.config
+    // Apply config in priority order: sharedServiceConfig < coinConfigs[coin] < options.config
+    // This allows per-coin tuning while still allowing runtime overrides
     const mergedConfig = {
       ...this.sharedServiceConfig,
+      ...coinConfig,  // Coin-specific overrides (excludes 'enabled' flag)
       ...options.config,
     };
+    // Remove 'enabled' from merged config as it's not a DipArbServiceConfig field
+    delete (mergedConfig as any).enabled;
     // Also update manager's debug flag if set in config
     if (mergedConfig.debug !== undefined) {
       this.debug = mergedConfig.debug;
@@ -176,12 +215,18 @@ export class DipArbManager extends EventEmitter {
     this.setupEventForwarding(service, coin);
 
     // Find and start the market
+    console.log(`[DipArbManager] Calling service.findAndStart for ${coin}...`);
+    const findStartTime = Date.now();
     const market = await service.findAndStart({
       coin,
       preferDuration: options.preferDuration ?? '15m',
     });
+    console.log(
+      `[DipArbManager] service.findAndStart completed for ${coin} in ${Date.now() - findStartTime}ms, market=${market ? market.name : 'null'}`
+    );
 
     if (!market) {
+      console.log(`[DipArbManager] No market found for ${coin}`);
       this.log(`No market found for ${coin}`);
       return null;
     }
@@ -366,6 +411,46 @@ export class DipArbManager extends EventEmitter {
       ...config,
     };
     this.log(`Shared config updated: ${JSON.stringify(config)}`);
+  }
+
+  /**
+   * Update coin-specific configurations
+   *
+   * Allows tuning parameters per asset based on market dynamics:
+   * - BTC: May need stricter maxRequiredLeg2Drop due to efficient markets
+   * - XRP: May allow looser sumTarget due to higher volatility
+   *
+   * Example:
+   * ```typescript
+   * manager.updateCoinConfigs({
+   *   BTC: { enabled: false }, // Disable BTC trading
+   *   XRP: { sumTarget: 0.90 }, // Looser target for XRP
+   * });
+   * ```
+   */
+  updateCoinConfigs(configs: Partial<Record<DipArbUnderlying, CoinSpecificConfig>>): void {
+    // Merge with existing configs (deep merge per coin)
+    for (const [coin, config] of Object.entries(configs) as [DipArbUnderlying, CoinSpecificConfig][]) {
+      this.coinConfigs[coin] = {
+        ...this.coinConfigs[coin],
+        ...config,
+      };
+    }
+    this.log(`Coin configs updated: ${JSON.stringify(configs)}`);
+  }
+
+  /**
+   * Get current coin-specific configurations
+   */
+  getCoinConfigs(): Partial<Record<DipArbUnderlying, CoinSpecificConfig>> {
+    return { ...this.coinConfigs };
+  }
+
+  /**
+   * Check if a coin is enabled
+   */
+  isCoinEnabled(coin: DipArbUnderlying): boolean {
+    return this.coinConfigs[coin]?.enabled !== false;
   }
 
   /**
