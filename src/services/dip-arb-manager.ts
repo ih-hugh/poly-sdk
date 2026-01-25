@@ -761,6 +761,42 @@ export class DipArbManager extends EventEmitter {
         coin,
       });
     });
+
+    // ===== Settlement Awareness Event Forwarding =====
+
+    // Forward settlement decision events (legacy - for backward compatibility)
+    service.on('settlementDecision', (decision) => {
+      this.log(`[${coin}] Forwarding settlementDecision: ${decision.decision} - ${decision.reason}`);
+      this.emit('settlementDecision', {
+        ...decision,
+        coin,
+        marketConditionId: this.activeMarkets.get(coin)?.conditionId,
+        marketName: this.activeMarkets.get(coin)?.market.name,
+      });
+    });
+
+    // Forward enhanced settlement decision events (for observability & auto-tuning)
+    service.on('enhancedSettlementDecision', (decision) => {
+      this.log(`[${coin}] Forwarding enhancedSettlementDecision: ${decision.decision} - ${decision.reason}`);
+      this.emit('enhancedSettlementDecision', {
+        ...decision,
+        coin,
+        marketConditionId: this.activeMarkets.get(coin)?.conditionId,
+        marketName: this.activeMarkets.get(coin)?.market.name,
+      });
+    });
+
+    // Forward settlement outcome events (after market settles)
+    service.on('settlementOutcome', (outcome) => {
+      const profitStr = outcome.actualProfit >= 0 ? `+$${outcome.actualProfit.toFixed(2)}` : `-$${Math.abs(outcome.actualProfit).toFixed(2)}`;
+      this.log(`[${coin}] Forwarding settlementOutcome: ${outcome.outcome} (${outcome.decision}) ${profitStr}`);
+      this.emit('settlementOutcome', {
+        ...outcome,
+        coin,
+        marketConditionId: this.activeMarkets.get(coin)?.conditionId,
+        marketName: this.activeMarkets.get(coin)?.market.name,
+      });
+    });
   }
 }
 

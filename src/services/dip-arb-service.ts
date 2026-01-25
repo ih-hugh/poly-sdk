@@ -67,6 +67,12 @@ import {
   type DipArbDuration,
   type DipArbDurationString,
   type DipArbPendingRedemption,
+  // Settlement awareness types
+  type EnhancedSettlementDecision,
+  type SettlementOutcome,
+  type SettlementRuleEvaluations,
+  type SettlementEntryContext,
+  type SettlementMarketSnapshot,
   DEFAULT_DIP_ARB_CONFIG,
   DEFAULT_AUTO_ROTATE_CONFIG,
   DIP_ARB_CRYPTO_TAKER_FEE,
@@ -1145,6 +1151,9 @@ export class DipArbService extends EventEmitter {
     // Clear round state to prevent stale data during market rotation
     this.currentRound = null;
     this.leg1SignalEmitted = false;
+
+    // Clean up pending settlement checks
+    this.cleanupPendingSettlements();
 
     // Update stats
     this.stats.runningTimeMs = Date.now() - this.stats.startTime;
@@ -2398,7 +2407,52 @@ export class DipArbService extends EventEmitter {
     if (this.currentRound && this.currentRound.phase === 'leg1_filled') {
       const elapsed = (Date.now() - (this.currentRound.leg1?.timestamp || this.currentRound.startTime)) / 1000;
       if (elapsed > this.getLeg2TimeoutSeconds()) {
-        // ✅ FIX: Exit Leg1 position to avoid unhedged exposure
+        // ✅ Settlement Awareness: Get enhanced decision with full rule evaluations
+        const enhancedDecision = this.getEnhancedSettlementDecision();
+        const holdDecision = this.shouldHoldForSettlement();
+
+        // Calculate metrics for settlement decision event
+        const timeToEndMin = this.market
+          ? ((this.market.endTime instanceof Date
+              ? this.market.endTime.getTime()
+              : (typeof this.market.endTime === 'number' ? this.market.endTime : new Date(this.market.endTime).getTime()))
+            - Date.now()) / 60000
+          : 0;
+
+        // Emit legacy settlement decision event for backward compatibility
+        this.emit('settlementDecision', {
+          elapsed,
+          baseTimeout: this.getLeg2TimeoutSeconds(),
+          decision: holdDecision.hold ? 'HOLD' : 'EXIT',
+          reason: holdDecision.reason,
+          confidence: holdDecision.confidence,
+          leg1Side: this.currentRound.leg1?.side,
+          winProbability: this.getPositionWinProbability(this.currentRound.leg1?.side ?? 'UP'),
+          timeToEndMin,
+          roundId: this.currentRound.roundId,
+          marketName: this.market?.name ?? '',
+          underlying: this.market?.underlying,
+        });
+
+        // Emit enhanced settlement decision event with full rule evaluations for observability
+        if (enhancedDecision) {
+          this.emit('enhancedSettlementDecision', enhancedDecision);
+        }
+
+        if (holdDecision.hold) {
+          // Hold for settlement - don't exit
+          this.log(`🔒 Holding for settlement: ${holdDecision.reason} (confidence: ${(holdDecision.confidence * 100).toFixed(0)}%, time to end: ${timeToEndMin.toFixed(1)}min)`);
+
+          // Schedule settlement outcome watching if we're holding
+          if (enhancedDecision) {
+            this.scheduleSettlementOutcomeCheck(enhancedDecision);
+          }
+
+          // Don't exit - continue monitoring until market end
+          return;
+        }
+
+        // Proceed with timeout exit
         this.log(`⚠️ Leg2 timeout (${elapsed.toFixed(0)}s > ${this.getLeg2TimeoutSeconds()}s), exiting Leg1 position...`);
 
         // Try to sell Leg1 position
@@ -4075,6 +4129,488 @@ export class DipArbService extends EventEmitter {
     }
 
     return defaultTimeout; // Use config for longer markets
+  }
+
+  // ===== Private: Settlement Awareness Methods =====
+
+  /**
+   * Calculate win probability based on current token prices
+   * Token price approximates market's implied probability
+   *
+   * @param side - The position side (UP or DOWN)
+   * @returns Win probability as decimal (0-1)
+   */
+  private getPositionWinProbability(side: DipArbSide): number {
+    const upAsk = this.upAsks[0]?.price ?? 0.5;
+    const downAsk = this.downAsks[0]?.price ?? 0.5;
+
+    // Normalize to probabilities (should sum to ~1)
+    const total = upAsk + downAsk;
+    if (total === 0) return 0.5;
+
+    const upProb = upAsk / total;
+    const downProb = downAsk / total;
+
+    return side === 'UP' ? upProb : downProb;
+  }
+
+  /**
+   * Calculate expected value of holding to settlement
+   *
+   * @param leg1 - The leg1 fill info
+   * @returns Expected settlement value in USDC
+   */
+  private calculateSettlementExpectedValue(leg1: { side: DipArbSide; shares: number; price: number }): number {
+    const winProb = this.getPositionWinProbability(leg1.side);
+    // If we win: get $1 per share. If we lose: get $0
+    return winProb * leg1.shares * 1.0;
+  }
+
+  /**
+   * Get current market value if we exit now
+   * Accounts for slippage and fees on exit
+   *
+   * @param leg1 - The leg1 fill info
+   * @returns Current exit value in USDC (after fees)
+   */
+  private getCurrentExitValue(leg1: { side: DipArbSide; shares: number; price: number }): number {
+    const currentPrice = leg1.side === 'UP'
+      ? (this.upAsks[0]?.price ?? leg1.price)
+      : (this.downAsks[0]?.price ?? leg1.price);
+    // Account for slippage and fees on exit (~6% total cost)
+    return leg1.shares * currentPrice * 0.94;
+  }
+
+  /**
+   * Check if Chainlink price movement favors our position
+   *
+   * @param side - The position side (UP or DOWN)
+   * @returns Object with alignment status and delta from price to beat
+   */
+  private checkChainlinkAlignment(side: DipArbSide): { aligned: boolean; delta: number } {
+    if (!this.market?.priceToBeat || !this.currentUnderlyingPrice) {
+      return { aligned: false, delta: 0 };
+    }
+
+    const delta = (this.currentUnderlyingPrice - this.market.priceToBeat) / this.market.priceToBeat;
+
+    // UP wins if price >= priceToBeat (delta >= 0)
+    // DOWN wins if price < priceToBeat (delta < 0)
+    const aligned = (side === 'UP' && delta >= 0) || (side === 'DOWN' && delta < 0);
+
+    return { aligned, delta };
+  }
+
+  /**
+   * Check Binance momentum for settlement hold decision
+   *
+   * Note: This is a simplified sync version that uses Chainlink data as proxy.
+   * The full async Binance momentum check is not used here because
+   * shouldHoldForSettlement is called in a sync context.
+   *
+   * @param side - The position side (UP or DOWN)
+   * @returns Object with favorable status and momentum strength
+   */
+  private checkSettlementMomentum(side: DipArbSide): { favorable: boolean; strength: number } {
+    // Use Chainlink alignment as a proxy for momentum
+    // This avoids async calls in the sync shouldHoldForSettlement method
+    const chainlink = this.checkChainlinkAlignment(side);
+
+    if (!chainlink.aligned) {
+      return { favorable: false, strength: 0 };
+    }
+
+    // Convert delta to strength (cap at 1%)
+    const strength = Math.min(Math.abs(chainlink.delta), 0.01) / 0.01;
+
+    return { favorable: chainlink.aligned, strength };
+  }
+
+  /**
+   * Core decision method: Should we hold for settlement instead of timeout exit?
+   *
+   * Evaluates multiple factors:
+   * 1. Time to market end (always hold if very close)
+   * 2. Win probability from token prices
+   * 3. Expected value comparison (settlement vs exit)
+   * 4. Chainlink price alignment
+   * 5. Binance momentum (optional)
+   *
+   * @returns Decision object with hold boolean, reason, and confidence
+   */
+  private shouldHoldForSettlement(): { hold: boolean; reason: string; confidence: number } {
+    // Check if settlement awareness is enabled
+    if (!this.config.favorSettlement) {
+      return { hold: false, reason: 'disabled', confidence: 0 };
+    }
+
+    // Check if we have a valid position
+    if (!this.market || !this.currentRound?.leg1) {
+      return { hold: false, reason: 'no_position', confidence: 0 };
+    }
+
+    const leg1 = this.currentRound.leg1;
+    const now = Date.now();
+    const endTime = this.market.endTime instanceof Date
+      ? this.market.endTime.getTime()
+      : (typeof this.market.endTime === 'number' ? this.market.endTime : new Date(this.market.endTime).getTime());
+    const timeToEndMin = (endTime - now) / 60000;
+
+    // RULE 1: Always hold if very close to market end
+    const minTimeToEnd = this.config.minTimeToEndForHold ?? 3;
+    if (timeToEndMin > 0 && timeToEndMin < minTimeToEnd) {
+      return { hold: true, reason: 'near_settlement', confidence: 0.9 };
+    }
+
+    // Don't hold if market has already ended (let normal settlement logic handle)
+    if (timeToEndMin <= 0) {
+      return { hold: false, reason: 'market_ended', confidence: 0 };
+    }
+
+    // RULE 2: Check win probability
+    const winProb = this.getPositionWinProbability(leg1.side);
+    const threshold = this.config.settlementHoldThreshold ?? 0.50;
+
+    if (winProb >= threshold) {
+      return { hold: true, reason: 'high_probability', confidence: winProb };
+    }
+
+    // RULE 3: Expected value comparison
+    const expectedSettleValue = this.calculateSettlementExpectedValue(leg1);
+    const exitValue = this.getCurrentExitValue(leg1);
+
+    // If expected settlement value > exit value, hold is better
+    if (expectedSettleValue > exitValue && exitValue > 0) {
+      const evRatio = expectedSettleValue / exitValue;
+      return { hold: true, reason: 'positive_ev', confidence: Math.min(evRatio - 1, 0.5) };
+    }
+
+    // RULE 4: Chainlink alignment check
+    const chainlink = this.checkChainlinkAlignment(leg1.side);
+    if (chainlink.aligned && Math.abs(chainlink.delta) > 0.001) {
+      return { hold: true, reason: 'chainlink_aligned', confidence: 0.6 };
+    }
+
+    // RULE 5: Momentum validation (if enabled)
+    if (this.config.enableSettlementMomentum && this.binanceService) {
+      const momentum = this.checkSettlementMomentum(leg1.side);
+      const momentumThreshold = this.config.settlementMomentumThreshold ?? 0.3;
+      if (momentum.favorable && momentum.strength > momentumThreshold) {
+        return { hold: true, reason: 'momentum_favorable', confidence: momentum.strength };
+      }
+    }
+
+    // No conditions met - don't hold
+    return { hold: false, reason: 'no_edge', confidence: 0 };
+  }
+
+  /**
+   * Enhanced version of shouldHoldForSettlement that returns full rule evaluations
+   *
+   * This method computes all rule evaluations upfront and includes them in the result,
+   * enabling observability and auto-tuning of settlement parameters.
+   *
+   * @returns EnhancedSettlementDecision with full evaluation details
+   */
+  private getEnhancedSettlementDecision(): EnhancedSettlementDecision | null {
+    // Need valid position for enhanced decision
+    if (!this.market || !this.currentRound?.leg1) {
+      return null;
+    }
+
+    const leg1 = this.currentRound.leg1;
+    const now = Date.now();
+    const endTime = this.market.endTime instanceof Date
+      ? this.market.endTime.getTime()
+      : (typeof this.market.endTime === 'number' ? this.market.endTime : new Date(this.market.endTime).getTime());
+    const timeToEndMin = (endTime - now) / 60000;
+
+    // Get current prices
+    const upPrice = this.upAsks[0]?.price ?? 0.5;
+    const downPrice = this.downAsks[0]?.price ?? 0.5;
+    const currentChainlinkPrice = this.currentUnderlyingPrice ?? this.market.priceToBeat ?? 0;
+
+    // Config thresholds
+    const minTimeToEnd = this.config.minTimeToEndForHold ?? 3;
+    const probThreshold = this.config.settlementHoldThreshold ?? 0.50;
+    const momentumThreshold = this.config.settlementMomentumThreshold ?? 0.3;
+
+    // Compute all rule evaluations
+    const winProb = this.getPositionWinProbability(leg1.side);
+    const expectedSettleValue = this.calculateSettlementExpectedValue(leg1);
+    const exitValue = this.getCurrentExitValue(leg1);
+    const evRatio = exitValue > 0 ? expectedSettleValue / exitValue : 0;
+    const chainlink = this.checkChainlinkAlignment(leg1.side);
+    const momentum = this.checkSettlementMomentum(leg1.side);
+
+    // Build rule evaluations
+    const ruleEvaluations: SettlementRuleEvaluations = {
+      nearSettlement: {
+        passed: timeToEndMin > 0 && timeToEndMin < minTimeToEnd,
+        timeToEndMin,
+        threshold: minTimeToEnd,
+      },
+      highProbability: {
+        passed: winProb >= probThreshold,
+        winProb,
+        threshold: probThreshold,
+      },
+      positiveEV: {
+        passed: expectedSettleValue > exitValue && exitValue > 0,
+        settlementEV: expectedSettleValue,
+        exitValue,
+        evRatio,
+      },
+      chainlinkAligned: {
+        passed: chainlink.aligned && Math.abs(chainlink.delta) > 0.001,
+        delta: chainlink.delta,
+        currentPrice: currentChainlinkPrice,
+        priceToBeat: this.market.priceToBeat ?? 0,
+        side: leg1.side,
+      },
+      momentumFavorable: {
+        passed: this.config.enableSettlementMomentum && momentum.favorable && momentum.strength > momentumThreshold,
+        strength: momentum.strength,
+        threshold: momentumThreshold,
+        enabled: this.config.enableSettlementMomentum ?? false,
+      },
+    };
+
+    // Build entry context
+    const entryContext: SettlementEntryContext = {
+      leg1Side: leg1.side,
+      leg1EntryPrice: leg1.price,
+      leg1Shares: leg1.shares,
+      leg1Cost: leg1.price * leg1.shares,
+      enteredAt: leg1.timestamp,
+    };
+
+    // Build market snapshot
+    const marketSnapshot: SettlementMarketSnapshot = {
+      upPrice,
+      downPrice,
+      priceToBeat: this.market.priceToBeat ?? 0,
+      currentChainlinkPrice,
+      marketEndTime: endTime,
+    };
+
+    // Determine decision and reason based on rule priority
+    let decision: 'HOLD' | 'EXIT' = 'EXIT';
+    let reason: EnhancedSettlementDecision['reason'] = 'no_edge';
+    let confidence = 0;
+
+    // Check if feature is disabled
+    if (!this.config.favorSettlement) {
+      decision = 'EXIT';
+      reason = 'disabled';
+      confidence = 0;
+    }
+    // Check for market ended
+    else if (timeToEndMin <= 0) {
+      decision = 'EXIT';
+      reason = 'market_ended';
+      confidence = 0;
+    }
+    // Priority order for HOLD reasons
+    else if (ruleEvaluations.nearSettlement.passed) {
+      decision = 'HOLD';
+      reason = 'near_settlement';
+      confidence = 0.9;
+    } else if (ruleEvaluations.highProbability.passed) {
+      decision = 'HOLD';
+      reason = 'high_probability';
+      confidence = winProb;
+    } else if (ruleEvaluations.positiveEV.passed) {
+      decision = 'HOLD';
+      reason = 'positive_ev';
+      confidence = Math.min(evRatio - 1, 0.5);
+    } else if (ruleEvaluations.chainlinkAligned.passed) {
+      decision = 'HOLD';
+      reason = 'chainlink_aligned';
+      confidence = 0.6;
+    } else if (ruleEvaluations.momentumFavorable.passed) {
+      decision = 'HOLD';
+      reason = 'momentum_favorable';
+      confidence = momentum.strength;
+    }
+
+    return {
+      decision,
+      reason,
+      confidence,
+      ruleEvaluations,
+      entryContext,
+      marketSnapshot,
+      roundId: this.currentRound.roundId,
+      marketName: this.market.name,
+      underlying: this.market.underlying,
+      isPaper: this.config.paperMode ?? true,
+      timestamp: now,
+    };
+  }
+
+  // ===== Settlement Outcome Tracking =====
+
+  /** Map of pending settlement decisions awaiting outcome reconciliation */
+  private pendingSettlementDecisions: Map<string, EnhancedSettlementDecision> = new Map();
+
+  /** Timeouts for settlement outcome checks */
+  private settlementOutcomeTimeouts: Map<string, NodeJS.Timeout> = new Map();
+
+  /**
+   * Schedule a check for settlement outcome after market ends
+   *
+   * This method stores the decision and schedules a callback to check
+   * the outcome after the market settles.
+   *
+   * @param decision - The enhanced settlement decision to track
+   */
+  private scheduleSettlementOutcomeCheck(decision: EnhancedSettlementDecision): void {
+    const { roundId, marketSnapshot } = decision;
+
+    // Store the decision for later reconciliation
+    this.pendingSettlementDecisions.set(roundId, decision);
+
+    // Calculate delay until we should check outcome
+    const now = Date.now();
+    const marketEndTime = marketSnapshot.marketEndTime;
+    const bufferMs = (this.config.settlementWaitBuffer ?? 300) * 1000; // Default 5 min buffer
+
+    // Schedule outcome check for after market end + buffer
+    const checkDelay = Math.max(0, marketEndTime - now + bufferMs);
+
+    this.log(`📋 Scheduled settlement outcome check for ${roundId.slice(0, 20)}... in ${Math.round(checkDelay / 1000)}s`);
+
+    // Clear any existing timeout for this round
+    const existingTimeout = this.settlementOutcomeTimeouts.get(roundId);
+    if (existingTimeout) {
+      clearTimeout(existingTimeout);
+    }
+
+    // Schedule the outcome check
+    const timeout = setTimeout(() => {
+      this.checkSettlementOutcome(roundId);
+    }, checkDelay);
+
+    this.settlementOutcomeTimeouts.set(roundId, timeout);
+  }
+
+  /**
+   * Check the outcome of a settlement decision
+   *
+   * This is called after the market has settled to determine if the
+   * HOLD decision was correct and calculate actual vs counterfactual profit.
+   *
+   * @param roundId - The round ID to check
+   */
+  private async checkSettlementOutcome(roundId: string): Promise<void> {
+    const decision = this.pendingSettlementDecisions.get(roundId);
+    if (!decision) {
+      this.log(`⚠️ No pending decision found for ${roundId.slice(0, 20)}...`);
+      return;
+    }
+
+    // Clean up
+    this.pendingSettlementDecisions.delete(roundId);
+    this.settlementOutcomeTimeouts.delete(roundId);
+
+    try {
+      // Determine settlement outcome
+      const outcome = await this.calculateSettlementOutcome(decision);
+      if (outcome) {
+        this.emit('settlementOutcome', outcome);
+        this.log(`📊 Settlement outcome for ${roundId.slice(0, 20)}...: ${outcome.outcome} ` +
+          `(actual: $${outcome.actualProfit.toFixed(2)}, counterfactual: $${outcome.counterfactualProfit.toFixed(2)})`);
+      }
+    } catch (error) {
+      this.log(`❌ Error checking settlement outcome for ${roundId}: ${error}`);
+    }
+  }
+
+  /**
+   * Calculate the settlement outcome for a decision
+   *
+   * Uses the current Chainlink price (which should be the settlement price)
+   * to determine which side won and calculate actual/counterfactual profits.
+   *
+   * @param decision - The enhanced settlement decision
+   * @returns SettlementOutcome or null if unable to calculate
+   */
+  private async calculateSettlementOutcome(decision: EnhancedSettlementDecision): Promise<SettlementOutcome | null> {
+    const { entryContext, marketSnapshot, roundId, underlying, marketName, isPaper } = decision;
+
+    // Get settlement price (current Chainlink price after market end)
+    const settlementPrice = this.currentUnderlyingPrice ?? marketSnapshot.currentChainlinkPrice;
+
+    // Determine which side won
+    const settlementSide: DipArbSide = settlementPrice >= marketSnapshot.priceToBeat ? 'UP' : 'DOWN';
+
+    // Calculate actual profit (for HOLD decision)
+    let actualProfit: number;
+    let outcome: 'WIN' | 'LOSS';
+
+    if (decision.decision === 'HOLD') {
+      // For HOLD: we kept the position and it settled
+      const positionWon = entryContext.leg1Side === settlementSide;
+      if (positionWon) {
+        // Won at settlement: receive $1 per share minus entry cost
+        actualProfit = entryContext.leg1Shares - entryContext.leg1Cost;
+        outcome = 'WIN';
+      } else {
+        // Lost at settlement: lose entire entry cost
+        actualProfit = -entryContext.leg1Cost;
+        outcome = 'LOSS';
+      }
+    } else {
+      // For EXIT: we already exited at timeout, calculate what we got
+      // This is approximate since we don't track the actual exit price in the decision
+      const exitValue = marketSnapshot.upPrice * entryContext.leg1Shares * 0.94; // ~6% fees
+      actualProfit = exitValue - entryContext.leg1Cost;
+      outcome = actualProfit > 0 ? 'WIN' : 'LOSS';
+    }
+
+    // Calculate counterfactual profit (what would have happened with opposite decision)
+    let counterfactualProfit: number;
+    if (decision.decision === 'HOLD') {
+      // If we held, counterfactual is if we had exited
+      const wouldHaveExitedAt = decision.entryContext.leg1Side === 'UP'
+        ? marketSnapshot.upPrice
+        : marketSnapshot.downPrice;
+      counterfactualProfit = (wouldHaveExitedAt * entryContext.leg1Shares * 0.94) - entryContext.leg1Cost;
+    } else {
+      // If we exited, counterfactual is if we had held
+      const wouldHaveWon = entryContext.leg1Side === settlementSide;
+      if (wouldHaveWon) {
+        counterfactualProfit = entryContext.leg1Shares - entryContext.leg1Cost;
+      } else {
+        counterfactualProfit = -entryContext.leg1Cost;
+      }
+    }
+
+    return {
+      roundId,
+      decision: decision.decision,
+      outcome,
+      actualProfit,
+      counterfactualProfit,
+      settlementSide,
+      settlementPrice,
+      settledAt: Date.now(),
+      isPaper,
+      underlying,
+      marketName,
+    };
+  }
+
+  /**
+   * Clean up pending settlement checks when service stops
+   */
+  private cleanupPendingSettlements(): void {
+    for (const timeout of this.settlementOutcomeTimeouts.values()) {
+      clearTimeout(timeout);
+    }
+    this.settlementOutcomeTimeouts.clear();
+    this.pendingSettlementDecisions.clear();
   }
 
   /**

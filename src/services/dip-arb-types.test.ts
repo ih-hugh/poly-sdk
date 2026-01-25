@@ -28,17 +28,35 @@ describe('DipArb Types', () => {
 
   describe('DEFAULT_DIP_ARB_CONFIG', () => {
     it('should have sensible defaults', () => {
-      // Key safety parameters
-      expect(DEFAULT_DIP_ARB_CONFIG.minDipSidePrice).toBe(0.10);
-      expect(DEFAULT_DIP_ARB_CONFIG.maxLeg1Price).toBe(0.70);
-      expect(DEFAULT_DIP_ARB_CONFIG.maxOpenPositions).toBe(10);
+      // Key safety parameters (current optimized values)
+      expect(DEFAULT_DIP_ARB_CONFIG.minDipSidePrice).toBe(0.03);
+      expect(DEFAULT_DIP_ARB_CONFIG.maxLeg1Price).toBe(0.95);
+      expect(DEFAULT_DIP_ARB_CONFIG.maxOpenPositions).toBe(25);
 
-      // Profitability parameters
-      expect(DEFAULT_DIP_ARB_CONFIG.sumTarget).toBe(0.92);
-      expect(DEFAULT_DIP_ARB_CONFIG.dipThreshold).toBe(0.02);
+      // Profitability parameters (Settlement Hunter config)
+      expect(DEFAULT_DIP_ARB_CONFIG.sumTarget).toBe(0.88);
+      expect(DEFAULT_DIP_ARB_CONFIG.dipThreshold).toBe(0.025);
 
       // Paper mode should be default (safe)
       expect(DEFAULT_DIP_ARB_CONFIG.paperMode).toBe(true);
+    });
+
+    it('should have settlement awareness config enabled by default', () => {
+      // Settlement awareness should be enabled by default
+      expect(DEFAULT_DIP_ARB_CONFIG.favorSettlement).toBe(true);
+
+      // Conservative threshold (50%)
+      expect(DEFAULT_DIP_ARB_CONFIG.settlementHoldThreshold).toBe(0.50);
+
+      // Always hold if <3 min to market end
+      expect(DEFAULT_DIP_ARB_CONFIG.minTimeToEndForHold).toBe(3);
+
+      // 5 min buffer after market end
+      expect(DEFAULT_DIP_ARB_CONFIG.settlementWaitBuffer).toBe(300);
+
+      // Momentum validation disabled by default
+      expect(DEFAULT_DIP_ARB_CONFIG.enableSettlementMomentum).toBe(false);
+      expect(DEFAULT_DIP_ARB_CONFIG.settlementMomentumThreshold).toBe(0.3);
     });
   });
 

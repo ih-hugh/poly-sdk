@@ -276,6 +276,50 @@ export interface DipArbServiceConfig {
    * @default false
    */
   requireBinanceMomentum?: boolean;
+
+  // ============= Settlement Awareness Configuration =============
+
+  /**
+   * Enable smart settlement logic
+   * When enabled, positions trending favorably will hold for settlement
+   * rather than timing out at a loss
+   * @default true
+   */
+  favorSettlement?: boolean;
+
+  /**
+   * Minimum win probability threshold to hold for settlement
+   * Only hold if estimated win probability >= this threshold
+   * @default 0.50 (50% - conservative)
+   */
+  settlementHoldThreshold?: number;
+
+  /**
+   * Minutes before market end to always hold (regardless of probability)
+   * If time to market end is less than this, always hold for settlement
+   * @default 3
+   */
+  minTimeToEndForHold?: number;
+
+  /**
+   * Extra seconds to wait after market end for settlement processing
+   * @default 300 (5 minutes)
+   */
+  settlementWaitBuffer?: number;
+
+  /**
+   * Enable Binance momentum validation for settlement decisions
+   * When enabled, uses real-time Binance data to validate hold decisions
+   * @default false
+   */
+  enableSettlementMomentum?: boolean;
+
+  /**
+   * Minimum momentum strength for settlement hold decisions
+   * Only factors into hold decision if momentum strength exceeds this
+   * @default 0.3
+   */
+  settlementMomentumThreshold?: number;
 }
 
 /**
@@ -340,6 +384,13 @@ export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
   maxOpenPositions: 25,                 // ⚡ INCREASED: 25 concurrent positions (was 10)
   // Leg2 feasibility check - prevents entering polarized markets
   maxRequiredLeg2Drop: 0.15,            // ⚡ NEW: Max 15% drop required for Leg2 profitability
+  // Settlement awareness configuration
+  favorSettlement: true,                // ✅ Enable smart settlement logic
+  settlementHoldThreshold: 0.50,        // 50% win probability threshold (conservative)
+  minTimeToEndForHold: 3,               // Always hold if <3 min to market end
+  settlementWaitBuffer: 300,            // 5 min buffer after market end
+  enableSettlementMomentum: false,      // Momentum validation off by default
+  settlementMomentumThreshold: 0.3,     // 30% momentum strength threshold
 };
 
 // ============= Market Configuration =============
@@ -677,6 +728,167 @@ export interface DipArbServiceEvents {
   roundComplete: (result: DipArbRoundResult) => void;
   priceUpdate: (event: DipArbPriceUpdateEvent) => void;
   error: (error: Error) => void;
+}
+
+// ============= Settlement Awareness Types =============
+
+/**
+ * Rule evaluation result for a single settlement rule
+ */
+export interface SettlementRuleEvaluation {
+  passed: boolean;
+}
+
+/**
+ * Near settlement rule evaluation
+ */
+export interface NearSettlementEvaluation extends SettlementRuleEvaluation {
+  timeToEndMin: number;
+  threshold: number;
+}
+
+/**
+ * High probability rule evaluation
+ */
+export interface HighProbabilityEvaluation extends SettlementRuleEvaluation {
+  winProb: number;
+  threshold: number;
+}
+
+/**
+ * Positive EV rule evaluation
+ */
+export interface PositiveEVEvaluation extends SettlementRuleEvaluation {
+  settlementEV: number;
+  exitValue: number;
+  evRatio: number;
+}
+
+/**
+ * Chainlink alignment rule evaluation
+ */
+export interface ChainlinkAlignedEvaluation extends SettlementRuleEvaluation {
+  delta: number;
+  currentPrice: number;
+  priceToBeat: number;
+  side: DipArbSide;
+}
+
+/**
+ * Momentum rule evaluation
+ */
+export interface MomentumEvaluation extends SettlementRuleEvaluation {
+  strength: number;
+  threshold: number;
+  enabled: boolean;
+}
+
+/**
+ * All rule evaluations for a settlement decision
+ */
+export interface SettlementRuleEvaluations {
+  nearSettlement: NearSettlementEvaluation;
+  highProbability: HighProbabilityEvaluation;
+  positiveEV: PositiveEVEvaluation;
+  chainlinkAligned: ChainlinkAlignedEvaluation;
+  momentumFavorable: MomentumEvaluation;
+}
+
+/**
+ * Entry context for a settlement decision
+ */
+export interface SettlementEntryContext {
+  leg1Side: DipArbSide;
+  leg1EntryPrice: number;
+  leg1Shares: number;
+  leg1Cost: number;
+  enteredAt: number;
+}
+
+/**
+ * Market snapshot at time of settlement decision
+ */
+export interface SettlementMarketSnapshot {
+  upPrice: number;
+  downPrice: number;
+  priceToBeat: number;
+  currentChainlinkPrice: number;
+  marketEndTime: number;
+}
+
+/**
+ * Enhanced settlement decision with full rule evaluations
+ *
+ * This interface captures all details about why a HOLD/EXIT decision was made,
+ * enabling observability and future auto-tuning of settlement parameters.
+ */
+export interface EnhancedSettlementDecision {
+  /** Decision: HOLD for settlement or EXIT with timeout */
+  decision: 'HOLD' | 'EXIT';
+  /** Primary reason for the decision */
+  reason:
+    | 'disabled'
+    | 'no_position'
+    | 'near_settlement'
+    | 'market_ended'
+    | 'high_probability'
+    | 'positive_ev'
+    | 'chainlink_aligned'
+    | 'momentum_favorable'
+    | 'no_edge';
+  /** Confidence level (0-1) */
+  confidence: number;
+
+  /** All rule evaluations with their inputs/outputs */
+  ruleEvaluations: SettlementRuleEvaluations;
+
+  /** Entry context (leg1 position details) */
+  entryContext: SettlementEntryContext;
+
+  /** Market snapshot at decision time */
+  marketSnapshot: SettlementMarketSnapshot;
+
+  /** Round ID */
+  roundId: string;
+  /** Market name */
+  marketName: string;
+  /** Underlying asset */
+  underlying: DipArbUnderlying;
+  /** Whether this is a paper trade */
+  isPaper: boolean;
+  /** Decision timestamp */
+  timestamp: number;
+}
+
+/**
+ * Settlement outcome tracking
+ *
+ * After a market settles, this records whether the decision was correct
+ * and calculates both actual and counterfactual profits.
+ */
+export interface SettlementOutcome {
+  /** Round ID to link back to decision */
+  roundId: string;
+  /** The decision that was made */
+  decision: 'HOLD' | 'EXIT';
+  /** Actual outcome */
+  outcome: 'WIN' | 'LOSS';
+  /** Actual profit/loss from the decision */
+  actualProfit: number;
+  /** What the opposite decision would have yielded */
+  counterfactualProfit: number;
+  /** Which side won at settlement */
+  settlementSide: DipArbSide;
+  /** Final Chainlink price at settlement */
+  settlementPrice: number;
+  /** Settlement timestamp */
+  settledAt: number;
+  /** Whether this is a paper trade */
+  isPaper: boolean;
+  /** Underlying asset */
+  underlying: DipArbUnderlying;
+  /** Market name */
+  marketName: string;
 }
 
 // ============= Scan Options =============
