@@ -2437,16 +2437,15 @@ export class DipArbService extends EventEmitter {
         // Emit enhanced settlement decision event with full rule evaluations for observability
         if (enhancedDecision) {
           this.emit('enhancedSettlementDecision', enhancedDecision);
+          // Schedule settlement outcome check for BOTH hold and exit decisions
+          // For HOLD: tracks actual settlement result
+          // For EXIT: tracks counterfactual (what would have happened if we held)
+          this.scheduleSettlementOutcomeCheck(enhancedDecision);
         }
 
         if (holdDecision.hold) {
           // Hold for settlement - don't exit
           this.log(`🔒 Holding for settlement: ${holdDecision.reason} (confidence: ${(holdDecision.confidence * 100).toFixed(0)}%, time to end: ${timeToEndMin.toFixed(1)}min)`);
-
-          // Schedule settlement outcome watching if we're holding
-          if (enhancedDecision) {
-            this.scheduleSettlementOutcomeCheck(enhancedDecision);
-          }
 
           // Don't exit - continue monitoring until market end
           return;
@@ -4564,9 +4563,15 @@ export class DipArbService extends EventEmitter {
     } else {
       // For EXIT: we already exited at timeout, calculate what we got
       // This is approximate since we don't track the actual exit price in the decision
-      const exitValue = marketSnapshot.upPrice * entryContext.leg1Shares * 0.94; // ~6% fees
+      const exitPrice = entryContext.leg1Side === 'UP' ? marketSnapshot.upPrice : marketSnapshot.downPrice;
+      const exitValue = exitPrice * entryContext.leg1Shares * 0.94; // ~6% fees
       actualProfit = exitValue - entryContext.leg1Cost;
-      outcome = actualProfit > 0 ? 'WIN' : 'LOSS';
+      // For EXIT, determine win/loss based on whether exiting was better than holding
+      const wouldHaveWon = entryContext.leg1Side === settlementSide;
+      const holdProfit = wouldHaveWon
+        ? entryContext.leg1Shares - entryContext.leg1Cost
+        : -entryContext.leg1Cost;
+      outcome = actualProfit >= holdProfit ? 'WIN' : 'LOSS';
     }
 
     // Calculate counterfactual profit (what would have happened with opposite decision)
