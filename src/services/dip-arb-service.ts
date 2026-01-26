@@ -1248,6 +1248,29 @@ export class DipArbService extends EventEmitter {
   }
 
   /**
+   * Get current bid prices for selling tokens
+   */
+  getCurrentBidPrices(): { upBid: number; downBid: number } {
+    const upBid = this.upBids[0]?.price ?? 0;
+    const downBid = this.downBids[0]?.price ?? 0;
+    return { upBid, downBid };
+  }
+
+  /**
+   * Get bid-ask spread for analysis
+   */
+  getSpread(): { upSpread: number; downSpread: number } {
+    const upAsk = this.upAsks[0]?.price ?? 0;
+    const upBid = this.upBids[0]?.price ?? 0;
+    const downAsk = this.downAsks[0]?.price ?? 0;
+    const downBid = this.downBids[0]?.price ?? 0;
+    return {
+      upSpread: upAsk > 0 && upBid > 0 ? (upAsk - upBid) / upAsk : 0,
+      downSpread: downAsk > 0 && downBid > 0 ? (downAsk - downBid) / downAsk : 0,
+    };
+  }
+
+  /**
    * Check if service is currently searching for a market
    */
   isSearching(): boolean {
