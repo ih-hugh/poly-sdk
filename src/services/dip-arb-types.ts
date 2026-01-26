@@ -1185,6 +1185,70 @@ export function getMaxSumTargetForNetProfit(
 }
 
 /**
+ * Calculate NET profit for a completed DipArb leg2 trade
+ *
+ * Formula: netProfit = (1 - totalCost) - (totalCost * feeRate * 2)
+ *
+ * @param leg1Price - Fill price for leg1
+ * @param leg2Price - Fill price for leg2
+ * @param shares - Number of shares traded
+ * @param feeRate - Taker fee rate (default: DIP_ARB_CRYPTO_TAKER_FEE)
+ * @returns NET profit in dollars (after fees)
+ */
+export function calculateDipArbLeg2NetProfit(
+  leg1Price: number,
+  leg2Price: number,
+  shares: number,
+  feeRate: number = DIP_ARB_CRYPTO_TAKER_FEE
+): number {
+  const totalCost = leg1Price + leg2Price;
+  const grossProfit = 1 - totalCost;
+  const totalFees = totalCost * feeRate * 2; // Fees on both legs
+  const netProfitPerShare = grossProfit - totalFees;
+  return netProfitPerShare * shares;
+}
+
+/**
+ * Calculate NET profit for a settlement win (holding leg1 to expiry)
+ *
+ * At settlement, you receive $1 per share if you win.
+ * You paid: leg1Cost + (leg1Cost * feeRate) when entering.
+ *
+ * @param leg1Cost - Cost paid for leg1 (shares * price, not including fee)
+ * @param shares - Number of shares
+ * @param feeRate - Taker fee rate (default: DIP_ARB_CRYPTO_TAKER_FEE)
+ * @returns NET profit in dollars
+ */
+export function calculateDipArbSettlementWinProfit(
+  leg1Cost: number,
+  shares: number,
+  feeRate: number = DIP_ARB_CRYPTO_TAKER_FEE
+): number {
+  const received = shares * 1; // $1 per winning share
+  const entryFee = leg1Cost * feeRate;
+  return received - leg1Cost - entryFee;
+}
+
+/**
+ * Calculate exit value after selling position
+ *
+ * Exit is a single SELL transaction, so only ONE fee (not two).
+ * Note: Entry fee was already paid, this is just the exit fee.
+ *
+ * @param exitPrice - Price received per share
+ * @param shares - Number of shares
+ * @param feeRate - Taker fee rate (default: DIP_ARB_CRYPTO_TAKER_FEE)
+ * @returns Value received after exit fee
+ */
+export function calculateDipArbExitValue(
+  exitPrice: number,
+  shares: number,
+  feeRate: number = DIP_ARB_CRYPTO_TAKER_FEE
+): number {
+  return exitPrice * shares * (1 - feeRate); // Single fee
+}
+
+/**
  * 计算基于底层资产价格变化的"真实"胜率
  *
  * @param currentPrice - 当前价格

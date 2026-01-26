@@ -12,6 +12,9 @@ import {
   estimateUpWinRate,
   createDipArbRoundState,
   getMarketContext,
+  calculateDipArbLeg2NetProfit,
+  calculateDipArbSettlementWinProfit,
+  calculateDipArbExitValue,
   DIP_ARB_CRYPTO_TAKER_FEE,
   DEFAULT_DIP_ARB_CONFIG,
   type DipArbMarketConfig,
@@ -228,6 +231,64 @@ describe('DipArb Types', () => {
       const expectedEnd = beforeCreate + 15 * 60 * 1000;
       expect(state.endTime).toBeGreaterThanOrEqual(expectedEnd);
       expect(state.endTime).toBeLessThanOrEqual(afterCreate + 15 * 60 * 1000);
+    });
+  });
+
+  describe('Profit Calculation Helpers', () => {
+    const FEE_RATE = DIP_ARB_CRYPTO_TAKER_FEE; // 0.03
+
+    describe('calculateDipArbLeg2NetProfit', () => {
+      it('should calculate correct NET profit', () => {
+        // leg1: 0.30, leg2: 0.33, shares: 50
+        // totalCost = 0.63, gross = 0.37, fees = 0.0378
+        // net = 0.3322 per share, total = 16.61
+        const result = calculateDipArbLeg2NetProfit(0.30, 0.33, 50, FEE_RATE);
+        expect(result).toBeCloseTo(16.61, 1);
+      });
+
+      it('should return negative for unprofitable trades', () => {
+        // totalCost = 0.95, gross = 0.05, fees = 0.057
+        // net = -0.007 per share (losing trade after fees)
+        const result = calculateDipArbLeg2NetProfit(0.50, 0.45, 50, FEE_RATE);
+        expect(result).toBeLessThan(0);
+      });
+
+      it('should use default fee rate when not provided', () => {
+        const withExplicit = calculateDipArbLeg2NetProfit(0.30, 0.33, 50, FEE_RATE);
+        const withDefault = calculateDipArbLeg2NetProfit(0.30, 0.33, 50);
+        expect(withDefault).toEqual(withExplicit);
+      });
+    });
+
+    describe('calculateDipArbSettlementWinProfit', () => {
+      it('should subtract entry fee from settlement win', () => {
+        // leg1Cost = 7.50 (50 shares @ 0.15)
+        // received = 50, entryFee = 0.225
+        // net = 50 - 7.50 - 0.225 = 42.275
+        const result = calculateDipArbSettlementWinProfit(7.50, 50, FEE_RATE);
+        expect(result).toBeCloseTo(42.275, 2);
+      });
+
+      it('should use default fee rate when not provided', () => {
+        const withExplicit = calculateDipArbSettlementWinProfit(7.50, 50, FEE_RATE);
+        const withDefault = calculateDipArbSettlementWinProfit(7.50, 50);
+        expect(withDefault).toEqual(withExplicit);
+      });
+    });
+
+    describe('calculateDipArbExitValue', () => {
+      it('should apply single 3% fee (not 6%)', () => {
+        // exitPrice = 0.20, shares = 50
+        // value = 10 * 0.97 = 9.70
+        const result = calculateDipArbExitValue(0.20, 50, FEE_RATE);
+        expect(result).toBeCloseTo(9.70, 2);
+      });
+
+      it('should use default fee rate when not provided', () => {
+        const withExplicit = calculateDipArbExitValue(0.20, 50, FEE_RATE);
+        const withDefault = calculateDipArbExitValue(0.20, 50);
+        expect(withDefault).toEqual(withExplicit);
+      });
     });
   });
 });
