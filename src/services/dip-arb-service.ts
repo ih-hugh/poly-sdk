@@ -207,6 +207,8 @@ export class DipArbService extends EventEmitter {
   // Orderbook state
   private upAsks: Array<{ price: number; size: number }> = [];
   private downAsks: Array<{ price: number; size: number }> = [];
+  private upBids: Array<{ price: number; size: number }> = [];
+  private downBids: Array<{ price: number; size: number }> = [];
 
   // Price history for sliding window detection
   // Each entry: { timestamp: number, upAsk: number, downAsk: number }
@@ -218,6 +220,9 @@ export class DipArbService extends EventEmitter {
 
   // Signal state - prevent duplicate signals within same round
   private leg1SignalEmitted = false;
+
+  // Settlement decision state - prevent duplicate settlement decisions within same round
+  private settlementDecisionEmittedForRound: string | null = null;
 
   // Smart logging state - reduce orderbook noise
   private lastOrderbookLogTime = 0;
@@ -1151,9 +1156,10 @@ export class DipArbService extends EventEmitter {
     // Clear round state to prevent stale data during market rotation
     this.currentRound = null;
     this.leg1SignalEmitted = false;
+    this.settlementDecisionEmittedForRound = null;
 
-    // Clean up pending settlement checks
-    this.cleanupPendingSettlements();
+    // Clean up pending settlement checks (processes outcomes before clearing)
+    await this.cleanupPendingSettlements();
 
     // Update stats
     this.stats.runningTimeMs = Date.now() - this.stats.startTime;
@@ -2150,11 +2156,13 @@ export class DipArbService extends EventEmitter {
     // OrderbookLevel has price and size as numbers
     if (isUpToken) {
       this.upAsks = book.asks.map(l => ({ price: l.price, size: l.size }));
+      this.upBids = book.bids.map(l => ({ price: l.price, size: l.size }));
       if (this.config.debug && this.upAsks.length === 0) {
         this.log('⚠️ UP orderbook is empty!');
       }
     } else if (isDownToken) {
       this.downAsks = book.asks.map(l => ({ price: l.price, size: l.size }));
+      this.downBids = book.bids.map(l => ({ price: l.price, size: l.size }));
       if (this.config.debug && this.downAsks.length === 0) {
         this.log('⚠️ DOWN orderbook is empty!');
       }
@@ -2167,15 +2175,17 @@ export class DipArbService extends EventEmitter {
     if (!this.lastOrderbookEmitTime || now - this.lastOrderbookEmitTime > 2000) {
       const upAsk = this.upAsks[0]?.price ?? 0;
       const downAsk = this.downAsks[0]?.price ?? 0;
+      const upBid = this.upBids[0]?.price ?? 0;
+      const downBid = this.downBids[0]?.price ?? 0;
       const upSize = this.upAsks[0]?.size ?? 0;
       const downSize = this.downAsks[0]?.size ?? 0;
-      
+
       // Emit orderbook (map UP→YES, DOWN→NO for frontend compatibility)
       this.emit('orderbook', {
         yesAsk: upAsk,
-        yesBid: 0, // DipArb doesn't track bids
+        yesBid: upBid,
         noAsk: downAsk,
-        noBid: 0,
+        noBid: downBid,
         yesAskSize: upSize,
         noAskSize: downSize,
         longCost: upAsk + downAsk,  // Cost to buy both sides
@@ -2384,6 +2394,7 @@ export class DipArbService extends EventEmitter {
 
       // Reset signal state for new round
       this.leg1SignalEmitted = false;
+      this.settlementDecisionEmittedForRound = null;
 
       this.stats.roundsMonitored++;
 
@@ -2438,7 +2449,9 @@ export class DipArbService extends EventEmitter {
         });
 
         // Emit enhanced settlement decision event with full rule evaluations for observability
-        if (enhancedDecision) {
+        // Guard: Only emit once per round to prevent duplicates on subsequent price polls
+        if (enhancedDecision && this.settlementDecisionEmittedForRound !== this.currentRound.roundId) {
+          this.settlementDecisionEmittedForRound = this.currentRound.roundId;
           this.emit('enhancedSettlementDecision', enhancedDecision);
           // Schedule settlement outcome check for BOTH hold and exit decisions
           // For HOLD: tracks actual settlement result
@@ -4623,12 +4636,34 @@ export class DipArbService extends EventEmitter {
 
   /**
    * Clean up pending settlement checks when service stops
+   * Processes any pending outcomes immediately before cleanup to avoid losing them
    */
-  private cleanupPendingSettlements(): void {
+  private async cleanupPendingSettlements(): Promise<void> {
+    // Cancel scheduled timeouts
     for (const timeout of this.settlementOutcomeTimeouts.values()) {
       clearTimeout(timeout);
     }
     this.settlementOutcomeTimeouts.clear();
+
+    // Process any pending settlement decisions immediately before clearing
+    // This ensures outcomes are emitted even when stopping for market rotation
+    if (this.pendingSettlementDecisions.size > 0) {
+      this.log(`Processing ${this.pendingSettlementDecisions.size} pending settlement outcome(s) before cleanup...`);
+
+      for (const [roundId, decision] of this.pendingSettlementDecisions.entries()) {
+        try {
+          const outcome = await this.calculateSettlementOutcome(decision);
+          if (outcome) {
+            this.emit('settlementOutcome', outcome);
+            this.log(`📊 Settlement outcome for ${roundId.slice(0, 20)}...: ${outcome.outcome} ` +
+              `(actual: $${outcome.actualProfit.toFixed(2)}, counterfactual: $${outcome.counterfactualProfit.toFixed(2)})`);
+          }
+        } catch (error) {
+          this.log(`❌ Error processing settlement outcome for ${roundId}: ${error}`);
+        }
+      }
+    }
+
     this.pendingSettlementDecisions.clear();
   }
 
