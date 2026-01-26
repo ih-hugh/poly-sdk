@@ -1901,6 +1901,16 @@ export class DipArbService extends EventEmitter {
           netProfit: netProfit, // ✅ Already NET profit
         });
 
+        // Cancel pending settlement outcome check - leg2 completed so actual outcome is the trade profit
+        // not the settlement decision outcome (which assumes only leg1 was held)
+        const pendingTimeout = this.settlementOutcomeTimeouts.get(signal.roundId);
+        if (pendingTimeout) {
+          clearTimeout(pendingTimeout);
+          this.settlementOutcomeTimeouts.delete(signal.roundId);
+          this.pendingSettlementDecisions.delete(signal.roundId);
+          this.log(`✅ Cancelled settlement outcome check for ${signal.roundId.slice(0, 20)}... (leg2 completed)`);
+        }
+
         // Auto merge if enabled
         if (this.config.autoMerge) {
           const mergeResult = await this.merge();
