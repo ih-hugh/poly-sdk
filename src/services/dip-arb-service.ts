@@ -83,6 +83,9 @@ import {
   createDipArbRoundState,
   calculateDipArbProfitRate,
   calculateDipArbNetProfitRate,
+  calculateDipArbLeg2NetProfit,
+  calculateDipArbSettlementWinProfit,
+  calculateDipArbExitValue,
   estimateUpWinRate,
   detectMispricing,
   parseUnderlyingFromSlug,
@@ -1814,11 +1817,19 @@ export class DipArbService extends EventEmitter {
         };
         this.currentRound.phase = 'completed';
         this.currentRound.totalCost = actualTotalCost;
-        this.currentRound.profit = 1 - actualTotalCost;
+
+        // ✅ FIX: Calculate NET profit after fees (same as paper mode)
+        const feeRate = this.config.takerFeeRate ?? DIP_ARB_CRYPTO_TAKER_FEE;
+        const grossProfit = 1 - actualTotalCost;
+        const totalFees = actualTotalCost * feeRate * 2;
+        const netProfitPerShare = grossProfit - totalFees;
+        const netProfit = netProfitPerShare * totalSharesFilled;
+
+        this.currentRound.profit = netProfitPerShare; // Store NET profit per share
 
         this.stats.leg2Filled++;
         this.stats.roundsSuccessful++;
-        this.stats.totalProfit += this.currentRound.profit * totalSharesFilled;
+        this.stats.totalProfit += netProfit; // ✅ Use NET profit
         this.stats.totalSpent += actualTotalCost * totalSharesFilled;
         this.openPositionCount = Math.max(0, this.openPositionCount - 1);  // Position hedged
 
@@ -1827,13 +1838,12 @@ export class DipArbService extends EventEmitter {
         // Detailed execution logging
         const slippage = ((avgPrice - signal.currentPrice) / signal.currentPrice * 100);
         const execTimeMs = Date.now() - startTime;
-        const profitPerShare = this.currentRound.profit;
-        const totalProfit = profitPerShare * totalSharesFilled;
+        const grossProfitTotal = grossProfit * totalSharesFilled;
 
         this.log(`✅ Leg2 FILLED: ${signal.hedgeSide} x${totalSharesFilled.toFixed(1)} @ ${avgPrice.toFixed(4)}`);
         this.log(`   Expected: ${signal.currentPrice.toFixed(4)} | Actual: ${avgPrice.toFixed(4)} | Slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}%`);
         this.log(`   Leg1: ${leg1Price.toFixed(4)} + Leg2: ${avgPrice.toFixed(4)} = ${actualTotalCost.toFixed(4)}`);
-        this.log(`   💰 Profit: $${totalProfit.toFixed(2)} (${(profitPerShare * 100).toFixed(2)}% per share)`);
+        this.log(`   💰 Profit: $${netProfit.toFixed(2)} NET (gross: $${grossProfitTotal.toFixed(2)}, fees: $${(totalFees * totalSharesFilled).toFixed(2)})`);
         this.log(`   Execution time: ${execTimeMs}ms | Orders: ${splitCount - failedOrders}/${splitCount}`);
 
         // Log orderbook after execution
@@ -1841,12 +1851,8 @@ export class DipArbService extends EventEmitter {
           this.logOrderbookContext('Post-Leg2');
         }
 
-        // Calculate both gross and net profit rates for reporting
-        const grossProfitRate = calculateDipArbProfitRate(this.currentRound.totalCost);
-        const feeRate = this.config.takerFeeRate ?? DIP_ARB_CRYPTO_TAKER_FEE;
-        const netProfitRate = this.config.useFeeAdjustedProfit
-          ? calculateDipArbNetProfitRate(this.currentRound.totalCost, feeRate)
-          : grossProfitRate;
+        // Calculate net profit rate for reporting
+        const netProfitRate = calculateDipArbNetProfitRate(this.currentRound.totalCost, feeRate);
 
         const roundResult: DipArbRoundResult = {
           roundId: signal.roundId,
@@ -1854,19 +1860,19 @@ export class DipArbService extends EventEmitter {
           leg1: this.currentRound.leg1,
           leg2: this.currentRound.leg2,
           totalCost: this.currentRound.totalCost,
-          profit: this.currentRound.profit,
-          profitRate: netProfitRate, // Now reports NET profit rate after fees
+          profit: netProfit, // ✅ FIX: Use NET profit (was: this.currentRound.profit)
+          profitRate: netProfitRate,
           merged: false,
         };
 
         this.emit('roundComplete', roundResult);
 
-        // ✅ FIX: Emit position closed event for backend persistence
+        // Emit position closed event for backend persistence
         this.emit('openPositionClosed', {
           roundId: signal.roundId,
           status: 'closed',
           closeType: 'leg2',
-          netProfit: totalProfit,
+          netProfit: netProfit, // ✅ Already NET profit
         });
 
         // Auto merge if enabled
