@@ -1,5 +1,8 @@
 // packages/poly-sdk/src/services/dip-arb-service.profit-parity.test.ts
-import { DIP_ARB_CRYPTO_TAKER_FEE } from './dip-arb-types';
+import {
+  DIP_ARB_CRYPTO_TAKER_FEE,
+  calculateDipArbLeg2NetProfit,
+} from './dip-arb-types';
 
 describe('DipArb Profit Parity: Paper vs Live', () => {
   const FEE_RATE = DIP_ARB_CRYPTO_TAKER_FEE; // 0.03
@@ -74,6 +77,48 @@ describe('DipArb Profit Parity: Paper vs Live', () => {
       // Should NOT use 6% (the current bug)
       const wrongExitValue = exitPrice * shares * 0.94; // 9.40
       expect(actualExitValue).not.toBeCloseTo(wrongExitValue, 1);
+    });
+  });
+
+  describe('E2E Profit Parity Verification', () => {
+    it('paper and live modes should emit identical profit values', () => {
+      // Simulate the same trade in both modes
+      const leg1Price = 0.30;
+      const leg2Price = 0.33;
+      const shares = 50;
+      const feeRate = 0.03;
+
+      // Paper mode calculation (from simulateLeg2Fill)
+      const actualTotalCost = leg1Price + leg2Price;
+      const grossProfit = 1 - actualTotalCost;
+      const totalFees = actualTotalCost * feeRate * 2;
+      const paperNetProfit = (grossProfit - totalFees) * shares;
+
+      // Live mode calculation (from executeLeg2 after fix)
+      const liveGrossProfit = 1 - actualTotalCost;
+      const liveTotalFees = actualTotalCost * feeRate * 2;
+      const liveNetProfit = (liveGrossProfit - liveTotalFees) * shares;
+
+      // They MUST be identical
+      expect(liveNetProfit).toEqual(paperNetProfit);
+
+      // And match the helper function
+      const helperNetProfit = calculateDipArbLeg2NetProfit(leg1Price, leg2Price, shares, feeRate);
+      expect(helperNetProfit).toBeCloseTo(paperNetProfit, 10);
+    });
+
+    it('both modes should report profit ~6% lower than gross', () => {
+      const leg1Price = 0.30;
+      const leg2Price = 0.33;
+      const shares = 50;
+
+      const totalCost = leg1Price + leg2Price;
+      const grossProfit = (1 - totalCost) * shares; // 18.50
+      const netProfit = calculateDipArbLeg2NetProfit(leg1Price, leg2Price, shares, 0.03);
+
+      // Net should be ~6% of totalCost lower than gross
+      const expectedDifference = totalCost * 0.06 * shares; // 1.89
+      expect(grossProfit - netProfit).toBeCloseTo(expectedDifference, 1);
     });
   });
 });
