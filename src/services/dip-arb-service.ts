@@ -83,9 +83,6 @@ import {
   createDipArbRoundState,
   calculateDipArbProfitRate,
   calculateDipArbNetProfitRate,
-  calculateDipArbLeg2NetProfit,
-  calculateDipArbSettlementWinProfit,
-  calculateDipArbExitValue,
   estimateUpWinRate,
   detectMispricing,
   parseUnderlyingFromSlug,
@@ -4557,44 +4554,55 @@ export class DipArbService extends EventEmitter {
     if (decision.decision === 'HOLD') {
       // For HOLD: we kept the position and it settled
       const positionWon = entryContext.leg1Side === settlementSide;
+      const feeRate = this.config.takerFeeRate ?? DIP_ARB_CRYPTO_TAKER_FEE;
+      const entryFee = entryContext.leg1Cost * feeRate;
+
       if (positionWon) {
-        // Won at settlement: receive $1 per share minus entry cost
-        actualProfit = entryContext.leg1Shares - entryContext.leg1Cost;
+        // Won at settlement: receive $1 per share minus entry cost AND entry fee
+        actualProfit = entryContext.leg1Shares - entryContext.leg1Cost - entryFee;
         outcome = 'WIN';
       } else {
-        // Lost at settlement: lose entire entry cost
-        actualProfit = -entryContext.leg1Cost;
+        // Lost at settlement: lose entire entry cost (fee was already paid)
+        actualProfit = -entryContext.leg1Cost - entryFee;
         outcome = 'LOSS';
       }
     } else {
       // For EXIT: we already exited at timeout, calculate what we got
       // This is approximate since we don't track the actual exit price in the decision
       const exitPrice = entryContext.leg1Side === 'UP' ? marketSnapshot.upPrice : marketSnapshot.downPrice;
-      const exitValue = exitPrice * entryContext.leg1Shares * 0.94; // ~6% fees
-      actualProfit = exitValue - entryContext.leg1Cost;
+      const feeRate = this.config.takerFeeRate ?? DIP_ARB_CRYPTO_TAKER_FEE;
+      // Exit is a single SELL = single fee (3%, not 6%)
+      // But we also paid entry fee on leg1
+      const exitValue = exitPrice * entryContext.leg1Shares * (1 - feeRate);
+      const entryFee = entryContext.leg1Cost * feeRate;
+      actualProfit = exitValue - entryContext.leg1Cost - entryFee;
       // For EXIT, determine win/loss based on whether exiting was better than holding
       const wouldHaveWon = entryContext.leg1Side === settlementSide;
       const holdProfit = wouldHaveWon
-        ? entryContext.leg1Shares - entryContext.leg1Cost
-        : -entryContext.leg1Cost;
+        ? entryContext.leg1Shares - entryContext.leg1Cost - entryFee
+        : -entryContext.leg1Cost - entryFee;
       outcome = actualProfit >= holdProfit ? 'WIN' : 'LOSS';
     }
 
     // Calculate counterfactual profit (what would have happened with opposite decision)
     let counterfactualProfit: number;
+    const cfFeeRate = this.config.takerFeeRate ?? DIP_ARB_CRYPTO_TAKER_FEE;
+    const cfEntryFee = entryContext.leg1Cost * cfFeeRate;
+
     if (decision.decision === 'HOLD') {
       // If we held, counterfactual is if we had exited
       const wouldHaveExitedAt = decision.entryContext.leg1Side === 'UP'
         ? marketSnapshot.upPrice
         : marketSnapshot.downPrice;
-      counterfactualProfit = (wouldHaveExitedAt * entryContext.leg1Shares * 0.94) - entryContext.leg1Cost;
+      const exitValue = wouldHaveExitedAt * entryContext.leg1Shares * (1 - cfFeeRate);
+      counterfactualProfit = exitValue - entryContext.leg1Cost - cfEntryFee;
     } else {
       // If we exited, counterfactual is if we had held
       const wouldHaveWon = entryContext.leg1Side === settlementSide;
       if (wouldHaveWon) {
-        counterfactualProfit = entryContext.leg1Shares - entryContext.leg1Cost;
+        counterfactualProfit = entryContext.leg1Shares - entryContext.leg1Cost - cfEntryFee;
       } else {
-        counterfactualProfit = -entryContext.leg1Cost;
+        counterfactualProfit = -entryContext.leg1Cost - cfEntryFee;
       }
     }
 
