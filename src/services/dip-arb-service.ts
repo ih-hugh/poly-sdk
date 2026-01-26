@@ -2507,10 +2507,11 @@ export class DipArbService extends EventEmitter {
     try {
       this.log(`Selling ${leg1.shares} ${leg1.side} tokens...`);
 
-      // Get current price for the token
+      // Get current BID price for selling the token
+      // When selling, we hit the bid side of the orderbook
       const currentPrice = leg1.side === 'UP'
-        ? (this.upAsks[0]?.price ?? 0.5)
-        : (this.downAsks[0]?.price ?? 0.5);
+        ? (this.upBids[0]?.price ?? this.upAsks[0]?.price ?? 0.5)
+        : (this.downBids[0]?.price ?? this.downAsks[0]?.price ?? 0.5);
 
       const exitAmount = leg1.shares * currentPrice;
 
@@ -2530,18 +2531,30 @@ export class DipArbService extends EventEmitter {
       if (this.config.paperMode) {
         const simulatedSlippage = 0.005 + Math.random() * 0.01; // 0.5-1.5% simulated slippage
         const soldPrice = currentPrice * (1 - simulatedSlippage);
-        const loss = (leg1.price - soldPrice) * leg1.shares;
-        
-        this.log(`📝 [PAPER] Leg1 exit simulated: sold ${leg1.shares}x ${leg1.side} @ ~${soldPrice.toFixed(4)} | Loss: $${loss.toFixed(2)}`);
-        
+        const exitValue = leg1.shares * soldPrice;
+
+        // Calculate fee (3% taker fee on exit)
+        const feeRate = this.config.takerFeeRate ?? 0.03;
+        const exitFee = exitValue * feeRate;
+
+        // Loss = entry cost - exit value after fees
+        const entryCost = leg1.price * leg1.shares;
+        const netExitValue = exitValue - exitFee;
+        const loss = entryCost - netExitValue;
+
+        const askPrice = leg1.side === 'UP' ? this.upAsks[0]?.price : this.downAsks[0]?.price;
+        this.log(`📝 [PAPER] Leg1 exit simulated: sold ${leg1.shares}x ${leg1.side} @ ~${soldPrice.toFixed(4)} (bid=${currentPrice.toFixed(4)}, ask=${askPrice?.toFixed(4) ?? 'N/A'})`);
+        this.log(`   Entry: $${entryCost.toFixed(2)}, Exit: $${exitValue.toFixed(2)}, Fee: $${exitFee.toFixed(2)}, Net Loss: $${loss.toFixed(2)}`);
+
         // Emit paper trade event for the exit
         this.emit('paperTrade', {
           type: 'exit',
           side: leg1.side,
           shares: leg1.shares,
           price: soldPrice,
-          cost: -exitAmount, // Negative cost = received money
+          cost: -netExitValue, // Negative cost = received money (after fees)
           profit: -Math.abs(loss),
+          fee: exitFee,
           expectedPrice: currentPrice,              // Price before slippage
           slippagePercent: simulatedSlippage,       // As decimal (e.g., 0.01 for 1%)
           marketName: this.market.name,
