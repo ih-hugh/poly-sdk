@@ -1043,6 +1043,7 @@ export class DipArbService extends EventEmitter {
             marketName: positionData.marketName,
             conditionId: positionData.marketConditionId,
             timestamp: Date.now(),
+            roundId: positionData.roundId,           // For round grouping in execution log
           });
 
           this.emit('openPositionClosed', {
@@ -1726,6 +1727,7 @@ export class DipArbService extends EventEmitter {
         marketName: this.market.name,
         conditionId: this.market.conditionId,
         timestamp: Date.now(),
+        roundId: signal.roundId,                     // For round grouping in execution log
       });
 
       return {
@@ -2038,6 +2040,7 @@ export class DipArbService extends EventEmitter {
         marketName: this.market.name,
         conditionId: this.market.conditionId,
         timestamp: Date.now(),
+        roundId: signal.roundId,                     // For round grouping in execution log
       });
 
       // Emit round complete
@@ -2635,6 +2638,7 @@ export class DipArbService extends EventEmitter {
           marketName: this.market.name,
           conditionId: this.market.conditionId,
           timestamp: Date.now(),
+          roundId: this.currentRound.roundId,       // For round grouping in execution log
         });
 
         // ✅ FIX: Emit position closed event for backend persistence
@@ -3738,6 +3742,7 @@ export class DipArbService extends EventEmitter {
           marketName: pending.market.name,
           conditionId: pending.market.conditionId,
           timestamp: Date.now(),
+          roundId: pending.round.roundId,            // For round grouping in execution log
         });
 
         // Emit position closed event for backend persistence
@@ -4150,6 +4155,7 @@ export class DipArbService extends EventEmitter {
         marketName: this.market.name,
         conditionId: this.market.conditionId,
         timestamp: Date.now(),
+        roundId: this.currentRound.roundId,        // For round grouping in execution log
       });
 
       // Emit position closed event for backend persistence
@@ -4284,6 +4290,7 @@ export class DipArbService extends EventEmitter {
         marketName: this.market.name,
         conditionId: this.market.conditionId,
         timestamp: Date.now(),
+        roundId: this.currentRound.roundId,        // For round grouping in execution log
       });
 
       // Emit position closed event for backend persistence

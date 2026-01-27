@@ -620,6 +620,7 @@ export class DipArbManager extends EventEmitter {
         timestamp: trade.timestamp ?? Date.now(),
         coin,
         marketConditionId: activeMarket?.conditionId,
+        roundId: trade.roundId,  // For round grouping in execution log
       };
       this.log(`[${coin}] Forwarding paperTrade: type=${paperTradeEvent.type}, side=${paperTradeEvent.side}, shares=${paperTradeEvent.shares}, price=${paperTradeEvent.price}`);
       this.emit('paperTrade', paperTradeEvent);
