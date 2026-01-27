@@ -13,6 +13,7 @@
 import { EventEmitter } from 'events';
 import { DipArbService } from './dip-arb-service.js';
 import { RealtimeServiceV2 } from './realtime-service-v2.js';
+import { ClobWebSocketService } from './clob-websocket-service.js';
 import { TradingService } from './trading-service.js';
 import { MarketService } from './market-service.js';
 import { BinanceService } from './binance-service.js';
@@ -62,6 +63,8 @@ export interface ActiveMarket {
   market: DipArbMarketConfig;
   /** The DipArbService instance for this market */
   service: DipArbService;
+  /** The ClobWebSocketService instance for orderbook data */
+  clobService: ClobWebSocketService;
   /** Start time */
   startTime: number;
   /** User ID (for paper trading) */
@@ -182,18 +185,26 @@ export class DipArbManager extends EventEmitter {
     console.log(`[DipArbManager] Starting ${coin}...`);
     this.log(`Starting ${coin}...`);
 
-    // Create a NEW RealtimeServiceV2 for each coin to avoid Polymarket's
-    // per-connection subscription limit bug (only first clob_market sub works)
+    // Create a NEW RealtimeServiceV2 for each coin for Chainlink price feeds (RTDS)
     const coinRealtimeService = new RealtimeServiceV2({ debug: this.debug });
 
-    // Create a new DipArbService instance for this coin with its own WebSocket
+    // Create a NEW ClobWebSocketService for each coin for orderbook data
+    // This uses the new CLOB WebSocket endpoint (wss://ws-subscriptions-clob.polymarket.com/ws/market)
+    // which replaced the deprecated CLOB messages on RTDS
+    const coinClobService = new ClobWebSocketService({ debug: this.debug });
+
+    // Connect the CLOB WebSocket (realtimeService connects inside DipArbService.start())
+    coinClobService.connect();
+
+    // Create a new DipArbService instance for this coin with its own WebSocket connections
     const service = new DipArbService(
       coinRealtimeService,
       this.tradingService,
       this.marketService,
       this.privateKey,
       this.chainId,
-      this.binanceService ?? undefined
+      this.binanceService ?? undefined,
+      coinClobService  // NEW: pass CLOB WebSocket service for orderbook
     );
 
     // Apply config in priority order: sharedServiceConfig < coinConfigs[coin] < options.config
@@ -237,6 +248,7 @@ export class DipArbManager extends EventEmitter {
       conditionId: market.conditionId,
       market,
       service,
+      clobService: coinClobService,
       startTime: Date.now(),
       userId: options.userId ?? null,
     });
@@ -302,8 +314,11 @@ export class DipArbManager extends EventEmitter {
 
     this.log(`Stopping ${coin}...`);
 
-    // Stop the service
+    // Stop the DipArbService
     await active.service.stop();
+
+    // Disconnect the CLOB WebSocket for this coin
+    active.clobService.disconnect();
 
     // Remove from active markets
     this.activeMarkets.delete(coin);

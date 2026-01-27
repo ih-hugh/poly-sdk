@@ -39,6 +39,7 @@ import {
   type Subscription,
   type CryptoPrice,
 } from './realtime-service-v2.js';
+import { ClobWebSocketService } from './clob-websocket-service.js';
 import { TradingService, type MarketOrderParams } from './trading-service.js';
 import { MarketService } from './market-service.js';
 import { CTFClient } from '../clients/ctf-client.js';
@@ -165,7 +166,8 @@ function calculateTimeoutLossRate(elapsedSeconds: number, timeoutSeconds: number
 
 export class DipArbService extends EventEmitter {
   // Dependencies
-  private realtimeService: RealtimeServiceV2;
+  private realtimeService: RealtimeServiceV2;  // For Chainlink prices (RTDS)
+  private clobService: ClobWebSocketService | null = null;  // For orderbook (new CLOB WS)
   private tradingService: TradingService | null = null;
   private marketService: MarketService;
   private ctf: CTFClient | null = null;
@@ -233,6 +235,9 @@ export class DipArbService extends EventEmitter {
   // Orderbook emission throttling
   private lastOrderbookEmitTime = 0;
 
+  // Diagnostic logging throttling
+  private lastDiagnosticLogTime = 0;
+
   // FIX #5: Warm-up period for sliding window
   // Skip detection until price history has enough data for sliding window comparison
   private isWarmedUp = false;
@@ -244,11 +249,13 @@ export class DipArbService extends EventEmitter {
     marketService: MarketService,
     privateKey?: string,
     chainId: number = 137,
-    binanceService?: BinanceService
+    binanceService?: BinanceService,
+    clobService?: ClobWebSocketService
   ) {
     super();
 
     this.realtimeService = realtimeService;
+    this.clobService = clobService ?? null;
     this.tradingService = tradingService;
     this.marketService = marketService;
     this.binanceService = binanceService ?? null;
@@ -266,6 +273,14 @@ export class DipArbService extends EventEmitter {
         chainId,
       });
     }
+  }
+
+  /**
+   * Set CLOB WebSocket service for orderbook data
+   * Can be called after construction to enable orderbook subscriptions
+   */
+  setClobService(clobService: ClobWebSocketService): void {
+    this.clobService = clobService;
   }
 
   /**
@@ -855,10 +870,41 @@ export class DipArbService extends EventEmitter {
       console.log('[DipArb] ✅ WebSocket connected');
     }
 
-    // Subscribe to market orderbook
+    // Subscribe to market orderbook via CLOB WebSocket (or fallback to RTDS)
     console.log('[DipArb] Subscribing to orderbook...');
     this.log(`Subscribing to tokens: UP=${market.upTokenId.slice(0, 20)}..., DOWN=${market.downTokenId.slice(0, 20)}...`);
-    this.marketSubscription = this.realtimeService.subscribeMarkets(
+
+    // Use CLOB WebSocket if available (new endpoint), otherwise fall back to RTDS (deprecated)
+    const orderbookService = this.clobService ?? this.realtimeService;
+    if (this.clobService) {
+      console.log('[DipArb] Using CLOB WebSocket for orderbook (new endpoint)');
+      // Wait for CLOB WebSocket connection if not already connected
+      if (!this.clobService.isConnected()) {
+        console.log('[DipArb] Waiting for CLOB WebSocket connection...');
+        await new Promise<void>((resolve) => {
+          const timeout = setTimeout(() => {
+            console.log('[DipArb] ⚠️ CLOB WebSocket connection timeout, continuing anyway');
+            resolve();
+          }, 10000);
+
+          if (this.clobService!.isConnected()) {
+            clearTimeout(timeout);
+            resolve();
+            return;
+          }
+
+          this.clobService!.once('connected', () => {
+            clearTimeout(timeout);
+            console.log('[DipArb] ✅ CLOB WebSocket connected');
+            resolve();
+          });
+        });
+      }
+    } else {
+      console.log('[DipArb] ⚠️ No CLOB service available, falling back to RTDS (deprecated)');
+    }
+
+    this.marketSubscription = orderbookService.subscribeMarkets(
       [market.upTokenId, market.downTokenId],
       {
         onOrderbook: (book: OrderbookSnapshot) => {
@@ -2289,6 +2335,21 @@ export class DipArbService extends EventEmitter {
     const signal = this.detectSignal();
     if (signal) {
       this.handleSignal(signal);
+    }
+
+    // Periodic diagnostic logging (every 30 seconds)
+    if (!this.lastDiagnosticLogTime) {
+      this.lastDiagnosticLogTime = now;
+    }
+    if (now - this.lastDiagnosticLogTime >= 30000 && this.currentRound) {
+      this.lastDiagnosticLogTime = now;
+      const upPrice = this.upAsks[0]?.price ?? 0;
+      const downPrice = this.downAsks[0]?.price ?? 0;
+      const upPriceAgo = this.getPriceFromHistory('UP', this.config.slidingWindowMs);
+      const downPriceAgo = this.getPriceFromHistory('DOWN', this.config.slidingWindowMs);
+      const upDrop = upPriceAgo && upPriceAgo > 0 ? ((upPriceAgo - upPrice) / upPriceAgo * 100).toFixed(2) : 'N/A';
+      const downDrop = downPriceAgo && downPriceAgo > 0 ? ((downPriceAgo - downPrice) / downPriceAgo * 100).toFixed(2) : 'N/A';
+      console.log(`[DipArb] 📊 ${this.market?.underlying} Detection Status: phase=${this.currentRound.phase}, warmedUp=${this.isWarmedUp}, UP=${upPrice.toFixed(4)} (${upDrop}% drop), DOWN=${downPrice.toFixed(4)} (${downDrop}% drop), threshold=${(this.config.dipThreshold * 100).toFixed(1)}%, history=${this.priceHistory.length} pts`);
     }
   }
 
