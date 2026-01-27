@@ -2062,6 +2062,48 @@ export class DipArbService extends EventEmitter {
         netProfit: netProfitPerTrade,
       });
 
+      // ✅ P0 FIX: Cancel pending settlement outcome check when leg2 fills in paper mode
+      // This prevents the Settlement Tracker from showing hypothetical settlement profit
+      // instead of actual leg2 close profit
+      const pendingDecision = this.pendingSettlementDecisions.get(signal.roundId);
+      const pendingTimeout = this.settlementOutcomeTimeouts.get(signal.roundId);
+      if (pendingTimeout || pendingDecision) {
+        // Cancel the scheduled timeout
+        if (pendingTimeout) {
+          clearTimeout(pendingTimeout);
+          this.settlementOutcomeTimeouts.delete(signal.roundId);
+        }
+
+        // Emit corrected settlement outcome reflecting actual leg2 close
+        if (pendingDecision) {
+          const correctedOutcome: SettlementOutcome = {
+            roundId: signal.roundId,
+            decision: pendingDecision.decision, // Original HOLD/EXIT decision
+            outcome: netProfitPerTrade > 0 ? 'WIN' : 'LOSS', // Based on actual leg2 profit
+            actualProfit: netProfitPerTrade, // Actual leg2 close profit
+            counterfactualProfit: pendingDecision.decision === 'HOLD'
+              // If we decided HOLD but leg2 filled: counterfactual = what if we had exited at timeout
+              ? -(pendingDecision.entryContext.leg1Cost * (1 + (this.config.takerFeeRate ?? 0.03)))
+              // If we decided EXIT but leg2 filled anyway: counterfactual = settlement outcome
+              : (pendingDecision.entryContext.leg1Side === (this.currentUnderlyingPrice >= (this.currentRound?.priceToBeat ?? 0) ? 'UP' : 'DOWN')
+                  ? pendingDecision.entryContext.leg1Shares - pendingDecision.entryContext.leg1Cost - (pendingDecision.entryContext.leg1Cost * (this.config.takerFeeRate ?? 0.03))
+                  : -pendingDecision.entryContext.leg1Cost - (pendingDecision.entryContext.leg1Cost * (this.config.takerFeeRate ?? 0.03))),
+            settlementSide: this.currentUnderlyingPrice >= (this.currentRound?.priceToBeat ?? 0) ? 'UP' : 'DOWN',
+            settlementPrice: this.currentUnderlyingPrice ?? 0,
+            settledAt: Date.now(),
+            isPaper: true,
+            underlying: this.market?.underlying as DipArbUnderlying,
+            marketName: this.market?.name ?? '',
+          };
+
+          this.emit('settlementOutcome', correctedOutcome);
+          this.pendingSettlementDecisions.delete(signal.roundId);
+
+          this.log(`✅ [PAPER] Settlement outcome updated for ${signal.roundId.slice(0, 20)}... ` +
+            `(leg2 closed, actual profit: $${netProfitPerTrade.toFixed(2)} instead of hypothetical settlement)`);
+        }
+      }
+
       return {
         success: true,
         leg: 'leg2',
@@ -2607,6 +2649,54 @@ export class DipArbService extends EventEmitter {
         this.stats.totalProfit -= Math.abs(loss);
         this.openPositionCount = Math.max(0, this.openPositionCount - 1);  // Position closed
 
+        // ✅ FIX: Cancel pending settlement outcome check and emit corrected outcome with actual exit profit
+        // This ensures Settlement Tracker shows the actual exit loss, not approximate snapshot-based calculation
+        const roundId = this.currentRound.roundId;
+        const pendingDecision = this.pendingSettlementDecisions.get(roundId);
+        const pendingTimeout = this.settlementOutcomeTimeouts.get(roundId);
+        if (pendingTimeout || pendingDecision) {
+          // Cancel the scheduled timeout
+          if (pendingTimeout) {
+            clearTimeout(pendingTimeout);
+            this.settlementOutcomeTimeouts.delete(roundId);
+          }
+
+          // Emit corrected settlement outcome reflecting actual exit trade
+          if (pendingDecision) {
+            const actualExitProfit = -Math.abs(loss); // The actual exit loss
+            const feeRateForCf = this.config.takerFeeRate ?? 0.03;
+            const entryFeeForCf = entryCost * feeRateForCf;
+
+            // Counterfactual: what would have happened if we held to settlement
+            // We need to estimate settlement side based on current underlying price
+            const estimatedSettlementSide: DipArbSide = this.currentUnderlyingPrice >= (this.currentRound?.priceToBeat ?? 0) ? 'UP' : 'DOWN';
+            const wouldHaveWon = leg1.side === estimatedSettlementSide;
+            const counterfactualProfit = wouldHaveWon
+              ? leg1.shares - entryCost - entryFeeForCf  // Win: $1/share - cost - fee
+              : -entryCost - entryFeeForCf;              // Loss: lose entire cost + fee
+
+            const correctedOutcome: SettlementOutcome = {
+              roundId,
+              decision: pendingDecision.decision, // Original HOLD/EXIT decision
+              outcome: actualExitProfit >= counterfactualProfit ? 'WIN' : 'LOSS', // Did exit beat holding?
+              actualProfit: actualExitProfit, // Actual exit profit (negative = loss)
+              counterfactualProfit,
+              settlementSide: estimatedSettlementSide,
+              settlementPrice: this.currentUnderlyingPrice ?? 0,
+              settledAt: Date.now(),
+              isPaper: true,
+              underlying: this.market?.underlying as DipArbUnderlying,
+              marketName: this.market?.name ?? '',
+            };
+
+            this.emit('settlementOutcome', correctedOutcome);
+            this.pendingSettlementDecisions.delete(roundId);
+
+            this.log(`✅ [PAPER] Settlement outcome updated for ${roundId.slice(0, 20)}... ` +
+              `(exit executed, actual profit: $${actualExitProfit.toFixed(2)} instead of snapshot-based estimate)`);
+          }
+        }
+
         return {
           success: true,
           leg: 'exit',
@@ -2643,6 +2733,47 @@ export class DipArbService extends EventEmitter {
         // Update stats with the loss
         this.stats.totalProfit -= Math.abs(loss);
         this.openPositionCount = Math.max(0, this.openPositionCount - 1);  // Position closed
+
+        // ✅ FIX: Cancel pending settlement outcome check and emit corrected outcome with actual exit profit
+        const roundId = this.currentRound.roundId;
+        const pendingDecision = this.pendingSettlementDecisions.get(roundId);
+        const pendingTimeout = this.settlementOutcomeTimeouts.get(roundId);
+        if (pendingTimeout || pendingDecision) {
+          if (pendingTimeout) {
+            clearTimeout(pendingTimeout);
+            this.settlementOutcomeTimeouts.delete(roundId);
+          }
+
+          if (pendingDecision) {
+            const actualExitProfit = -Math.abs(loss);
+            const entryCost = leg1.price * leg1.shares;
+            const feeRateForCf = this.config.takerFeeRate ?? 0.03;
+            const entryFeeForCf = entryCost * feeRateForCf;
+            const estimatedSettlementSide: DipArbSide = this.currentUnderlyingPrice >= (this.currentRound?.priceToBeat ?? 0) ? 'UP' : 'DOWN';
+            const wouldHaveWon = leg1.side === estimatedSettlementSide;
+            const counterfactualProfit = wouldHaveWon
+              ? leg1.shares - entryCost - entryFeeForCf
+              : -entryCost - entryFeeForCf;
+
+            const correctedOutcome: SettlementOutcome = {
+              roundId,
+              decision: pendingDecision.decision,
+              outcome: actualExitProfit >= counterfactualProfit ? 'WIN' : 'LOSS',
+              actualProfit: actualExitProfit,
+              counterfactualProfit,
+              settlementSide: estimatedSettlementSide,
+              settlementPrice: this.currentUnderlyingPrice ?? 0,
+              settledAt: Date.now(),
+              isPaper: false,
+              underlying: this.market?.underlying as DipArbUnderlying,
+              marketName: this.market?.name ?? '',
+            };
+
+            this.emit('settlementOutcome', correctedOutcome);
+            this.pendingSettlementDecisions.delete(roundId);
+            this.log(`✅ Settlement outcome updated for ${roundId.slice(0, 20)}... (exit executed, actual profit: $${actualExitProfit.toFixed(2)})`);
+          }
+        }
 
         return {
           success: true,
@@ -3557,39 +3688,59 @@ export class DipArbService extends EventEmitter {
       pending.retryCount++;
       pending.lastRetryAt = now;
 
-      // In paper mode, simulate immediate redemption
+      // In paper mode, simulate redemption with ACTUAL win/loss determination
       if (this.config.paperMode) {
+        // Get settlement price - use current Chainlink price as proxy for settlement
+        // (In paper mode, we use the latest price for this underlying as the settlement price)
+        const settlementPrice = this.currentUnderlyingPrice ?? pending.round.priceToBeat ?? 0;
+
+        // Determine actual win/loss based on settlement price
+        const outcome = this.determineSettlementOutcome(pending.round, settlementPrice);
+
+        this.log(`🎯 [PENDING] Settlement outcome for ${pending.market.slug}: side=${outcome.side}, ` +
+          `positionWon=${outcome.positionWon}, leg1Side=${pending.round.leg1?.side}, ` +
+          `priceToBeat=${pending.round.priceToBeat}, settlementPrice=${settlementPrice.toLocaleString()}`);
+
+        // Calculate payout based on actual outcome
+        const amountReceived = outcome.leg1Payout + outcome.leg2Payout;
         const totalShares = (pending.round.leg1?.shares ?? 0) + (pending.round.leg2?.shares ?? 0);
-        const amountReceived = totalShares; // $1 per merged pair
+
+        this.log(`📊 [PENDING] Settlement payout: leg1=${outcome.leg1Payout.toFixed(2)}, ` +
+          `leg2=${outcome.leg2Payout.toFixed(2)}, totalReceived=$${amountReceived.toFixed(2)}`);
+
+        // Calculate total cost
         const totalCost = (pending.round.leg1?.price ?? 0) * (pending.round.leg1?.shares ?? 0) +
                           (pending.round.leg2?.price ?? 0) * (pending.round.leg2?.shares ?? 0);
 
-        // ✅ FIX: Calculate NET profit after fees
+        // Calculate NET profit after fees
         const grossProfit = amountReceived - totalCost;
         const feeRate = this.config.takerFeeRate ?? 0.03;
-        const totalFees = totalCost * feeRate * 2; // 6% total (3% per leg)
+        // Entry fee only (no exit fee on settlement redemption)
+        const entryFees = totalCost * feeRate;
+        const totalFees = entryFees;
         const netProfit = grossProfit - totalFees;
 
-        this.log(`📝 [PAPER] Redemption simulated: ${pending.market.slug} | Amount: $${amountReceived.toFixed(2)}`);
+        const outcomeStr = outcome.positionWon ? 'WIN' : 'LOSS';
+        this.log(`📝 [PAPER] Pending redemption: ${pending.market.slug} | ${outcomeStr} | Amount: $${amountReceived.toFixed(2)}`);
         this.log(`   💰 [PAPER] NET Profit: $${netProfit.toFixed(2)} (gross: $${grossProfit.toFixed(2)}, fees: $${totalFees.toFixed(2)})`);
 
-        // Emit paper trade event
+        // Emit paper trade event with correct profit
         this.emit('paperTrade', {
           type: 'settle',
           side: pending.round.leg1?.side ?? 'UP',
           shares: totalShares,
-          price: 1,
+          price: amountReceived > 0 ? amountReceived / totalShares : 0,
           cost: amountReceived,
-          profit: netProfit, // ✅ Use NET profit
+          profit: netProfit,
           profitRate: totalCost > 0 ? netProfit / (totalCost + totalFees) : 0,
-          expectedPrice: 1,                          // Settlement at $1 (no price uncertainty)
+          expectedPrice: 1,                          // Settlement at $1 for winner
           slippagePercent: 0,                        // No slippage on settlement
           marketName: pending.market.name,
           conditionId: pending.market.conditionId,
           timestamp: Date.now(),
         });
 
-        // ✅ FIX: Emit position closed event for backend persistence
+        // Emit position closed event for backend persistence
         this.emit('openPositionClosed', {
           roundId: pending.round.roundId,
           status: 'closed',
@@ -3610,7 +3761,7 @@ export class DipArbService extends EventEmitter {
         };
 
         this.emit('settled', settleResult);
-        this.stats.totalProfit += netProfit; // ✅ Use NET profit
+        this.stats.totalProfit += netProfit;
         continue;
       }
 
@@ -3940,50 +4091,74 @@ export class DipArbService extends EventEmitter {
       };
     }
 
-    // In paper mode, simulate the redeem
+    // In paper mode, simulate the redeem with ACTUAL win/loss determination
     if (this.config.paperMode) {
-      // Simulate successful redemption - assume market resolves in our favor
-      // For paper trading, we assume UP+DOWN tokens merge to $1 each
-      const totalShares = (this.currentRound?.leg1?.shares ?? 0) + (this.currentRound?.leg2?.shares ?? 0);
-      const amountReceived = totalShares; // $1 per merged pair
+      if (!this.currentRound) {
+        return {
+          success: false,
+          strategy: 'redeem',
+          error: 'No current round to settle',
+          executionTimeMs: Date.now() - startTime,
+        };
+      }
 
-      const totalCost = (this.currentRound?.leg1?.price ?? 0) * (this.currentRound?.leg1?.shares ?? 0) +
-                        (this.currentRound?.leg2?.price ?? 0) * (this.currentRound?.leg2?.shares ?? 0);
+      // Get settlement price (use current Chainlink price as settlement price)
+      const settlementPrice = this.currentUnderlyingPrice ?? this.currentRound.priceToBeat ?? 0;
 
-      // ✅ FIX: Calculate NET profit after fees
+      // Determine actual win/loss based on settlement price
+      const outcome = this.determineSettlementOutcome(this.currentRound, settlementPrice);
+
+      this.log(`🎯 Settlement outcome: side=${outcome.side}, positionWon=${outcome.positionWon}, ` +
+        `leg1Side=${this.currentRound.leg1?.side}, priceToBeat=${this.currentRound.priceToBeat}, ` +
+        `settlementPrice=${settlementPrice.toLocaleString()}`);
+
+      // Calculate payout based on actual outcome
+      const amountReceived = outcome.leg1Payout + outcome.leg2Payout;
+      const totalShares = (this.currentRound.leg1?.shares ?? 0) + (this.currentRound.leg2?.shares ?? 0);
+
+      this.log(`📊 Settlement payout: leg1=${outcome.leg1Payout.toFixed(2)}, leg2=${outcome.leg2Payout.toFixed(2)}, ` +
+        `totalReceived=$${amountReceived.toFixed(2)}`);
+
+      // Calculate total cost (entry costs)
+      const totalCost = (this.currentRound.leg1?.price ?? 0) * (this.currentRound.leg1?.shares ?? 0) +
+                        (this.currentRound.leg2?.price ?? 0) * (this.currentRound.leg2?.shares ?? 0);
+
+      // Calculate NET profit after fees
       const grossProfit = amountReceived - totalCost;
       const feeRate = this.config.takerFeeRate ?? 0.03;
-      const totalFees = totalCost * feeRate * 2; // 6% total (3% per leg)
+      // Entry fee was paid on leg1 (and leg2 if exists)
+      const entryFees = totalCost * feeRate;
+      // No exit fee on settlement redemption (unlike selling)
+      const totalFees = entryFees;
       const netProfit = grossProfit - totalFees;
 
-      this.log(`📝 [PAPER] Settle by redeem simulated: received ~$${amountReceived.toFixed(2)}`);
+      const outcomeStr = outcome.positionWon ? 'WIN' : 'LOSS';
+      this.log(`📝 [PAPER] Settle by redeem: ${outcomeStr}, received $${amountReceived.toFixed(2)}`);
       this.log(`   💰 [PAPER] NET Profit: $${netProfit.toFixed(2)} (gross: $${grossProfit.toFixed(2)}, fees: $${totalFees.toFixed(2)})`);
 
-      // Emit paper trade event
+      // Emit paper trade event with correct profit
       this.emit('paperTrade', {
         type: 'settle',
-        side: this.currentRound?.leg1?.side ?? 'UP',
+        side: this.currentRound.leg1?.side ?? 'UP',
         shares: totalShares,
-        price: 1, // $1 redemption
+        price: amountReceived > 0 ? amountReceived / totalShares : 0, // Actual payout per share
         cost: amountReceived,
-        profit: netProfit, // ✅ Use NET profit
+        profit: netProfit,
         profitRate: totalCost > 0 ? netProfit / (totalCost + totalFees) : 0,
-        expectedPrice: 1,                          // Settlement at $1 (no price uncertainty)
+        expectedPrice: 1,                          // Settlement at $1 for winner
         slippagePercent: 0,                        // No slippage on settlement
         marketName: this.market.name,
         conditionId: this.market.conditionId,
         timestamp: Date.now(),
       });
 
-      // ✅ FIX: Emit position closed event for backend persistence
-      if (this.currentRound) {
-        this.emit('openPositionClosed', {
-          roundId: this.currentRound.roundId,
-          status: 'closed',
-          closeType: 'settle',
-          netProfit: netProfit,
-        });
-      }
+      // Emit position closed event for backend persistence
+      this.emit('openPositionClosed', {
+        roundId: this.currentRound.roundId,
+        status: 'closed',
+        closeType: 'settle',
+        netProfit: netProfit,
+      });
 
       return {
         success: true,
@@ -4044,45 +4219,65 @@ export class DipArbService extends EventEmitter {
       };
     }
 
-    // In paper mode, simulate the sell
+    // In paper mode, simulate selling at current market prices (pre-settlement exit)
+    // Note: This is different from settleByRedeem which waits for settlement outcome.
+    // settleBySell is for early exits before market resolves, using current orderbook prices.
     if (this.config.paperMode) {
+      // Get settlement context for logging
+      const settlementPrice = this.currentUnderlyingPrice ?? this.currentRound.priceToBeat ?? 0;
+      const outcome = this.determineSettlementOutcome(this.currentRound, settlementPrice);
+
+      this.log(`🎯 [PAPER] Sell exit (pre-settlement): projected settlement would be ${outcome.side}, ` +
+        `position would ${outcome.positionWon ? 'WIN' : 'LOSE'} at settlement`);
+      this.log(`   Current Chainlink: $${settlementPrice.toLocaleString()}, priceToBeat: $${this.currentRound.priceToBeat.toLocaleString()}`);
+
+      // Calculate sell proceeds using current market prices (not settlement)
       let totalReceived = 0;
-      
+
       if (this.currentRound.leg1) {
         const price = this.currentRound.leg1.side === 'UP'
           ? (this.upAsks[0]?.price ?? 0.5)
           : (this.downAsks[0]?.price ?? 0.5);
         totalReceived += this.currentRound.leg1.shares * price * 0.99; // 1% slippage
       }
-      
+
       if (this.currentRound.leg2) {
         const price = this.currentRound.leg2.side === 'UP'
           ? (this.upAsks[0]?.price ?? 0.5)
           : (this.downAsks[0]?.price ?? 0.5);
         totalReceived += this.currentRound.leg2.shares * price * 0.99; // 1% slippage
       }
-      
-      // Calculate profit/loss from the settle
+
+      const totalShares = (this.currentRound.leg1?.shares ?? 0) + (this.currentRound.leg2?.shares ?? 0);
+
+      this.log(`📊 Sell payout: leg1=${this.currentRound.leg1?.shares ?? 0} @ ${this.currentRound.leg1?.side === 'UP' ? (this.upAsks[0]?.price ?? 0.5) : (this.downAsks[0]?.price ?? 0.5)}, ` +
+        `leg2=${this.currentRound.leg2?.shares ?? 0} @ ${this.currentRound.leg2?.side === 'UP' ? (this.upAsks[0]?.price ?? 0.5) : (this.downAsks[0]?.price ?? 0.5)}, ` +
+        `totalReceived=$${totalReceived.toFixed(2)}`);
+
+      // Calculate profit/loss from the sell
       const totalCost = (this.currentRound.leg1?.price ?? 0) * (this.currentRound.leg1?.shares ?? 0) +
                         (this.currentRound.leg2?.price ?? 0) * (this.currentRound.leg2?.shares ?? 0);
 
-      // ✅ FIX: Calculate NET profit after fees
+      // Calculate NET profit after fees
+      // Entry fee on leg1 (and leg2 if exists) + exit fee on sell
       const grossProfit = totalReceived - totalCost;
       const feeRate = this.config.takerFeeRate ?? 0.03;
-      const totalFees = totalCost * feeRate * 2; // 6% total (3% per leg)
+      const entryFees = totalCost * feeRate;
+      const exitFees = totalReceived * feeRate; // Exit fee on sell proceeds
+      const totalFees = entryFees + exitFees;
       const netProfit = grossProfit - totalFees;
 
-      this.log(`📝 [PAPER] Settle by sell simulated: received ~$${totalReceived.toFixed(2)}`);
+      this.log(`📝 [PAPER] Settle by sell: received $${totalReceived.toFixed(2)}`);
       this.log(`   💰 [PAPER] NET Profit: $${netProfit.toFixed(2)} (gross: $${grossProfit.toFixed(2)}, fees: $${totalFees.toFixed(2)})`);
 
       // Emit paper trade event for settle
       this.emit('paperTrade', {
         type: 'settle',
         side: this.currentRound.leg1?.side ?? 'UP',
-        shares: (this.currentRound.leg1?.shares ?? 0) + (this.currentRound.leg2?.shares ?? 0),
-        price: totalReceived / ((this.currentRound.leg1?.shares ?? 1) + (this.currentRound.leg2?.shares ?? 1)),
+        shares: totalShares,
+        price: totalShares > 0 ? totalReceived / totalShares : 0,
         cost: totalReceived,
-        profit: netProfit, // ✅ Use NET profit
+        profit: netProfit,
         profitRate: totalCost > 0 ? netProfit / (totalCost + totalFees) : 0,
         expectedPrice: 1,                          // Expected sell price before slippage
         slippagePercent: 0.01,                     // 1% simulated slippage on sell
@@ -4091,15 +4286,13 @@ export class DipArbService extends EventEmitter {
         timestamp: Date.now(),
       });
 
-      // ✅ FIX: Emit position closed event for backend persistence
-      if (this.currentRound) {
-        this.emit('openPositionClosed', {
-          roundId: this.currentRound.roundId,
-          status: 'closed',
-          closeType: 'settle',
-          netProfit: netProfit,
-        });
-      }
+      // Emit position closed event for backend persistence
+      this.emit('openPositionClosed', {
+        roundId: this.currentRound.roundId,
+        status: 'closed',
+        closeType: 'settle',
+        netProfit: netProfit,
+      });
 
       return {
         success: true,
@@ -4586,6 +4779,42 @@ export class DipArbService extends EventEmitter {
     } catch (error) {
       this.log(`❌ Error checking settlement outcome for ${roundId}: ${error}`);
     }
+  }
+
+  /**
+   * Determine settlement outcome for a round based on settlement price
+   *
+   * This is the single source of truth for win/loss determination in paper mode.
+   * Used by settleByRedeem(), settleBySell(), and processPendingRedemptions().
+   *
+   * @param round - The round state containing leg1/leg2 position info
+   * @param settlementPrice - The final Chainlink price at settlement (or current price)
+   * @returns Settlement outcome with side, win/loss status, and payouts
+   */
+  private determineSettlementOutcome(round: DipArbRoundState, settlementPrice: number): {
+    side: DipArbSide;
+    positionWon: boolean;
+    leg1Payout: number;
+    leg2Payout: number;
+  } {
+    // Determine which side won: UP if price >= priceToBeat, DOWN otherwise
+    const settlementSide: DipArbSide = settlementPrice >= (round.priceToBeat ?? 0) ? 'UP' : 'DOWN';
+
+    // Check if our leg1 position won
+    const positionWon = round.leg1?.side === settlementSide;
+
+    // Calculate payouts:
+    // - Winning side receives $1 per share
+    // - Losing side receives $0
+    const leg1Payout = positionWon ? (round.leg1?.shares ?? 0) : 0;
+    const leg2Payout = !positionWon && round.leg2 ? (round.leg2.shares ?? 0) : 0;
+
+    return {
+      side: settlementSide,
+      positionWon,
+      leg1Payout,
+      leg2Payout,
+    };
   }
 
   /**
