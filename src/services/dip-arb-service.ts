@@ -881,22 +881,38 @@ export class DipArbService extends EventEmitter {
       // Wait for CLOB WebSocket connection if not already connected
       if (!this.clobService.isConnected()) {
         console.log('[DipArb] Waiting for CLOB WebSocket connection...');
-        await new Promise<void>((resolve) => {
-          const timeout = setTimeout(() => {
-            console.log('[DipArb] ⚠️ CLOB WebSocket connection timeout, continuing anyway');
-            resolve();
-          }, 10000);
+        // Trigger connect in case it's not already connecting
+        this.clobService.connect();
 
+        await new Promise<void>((resolve) => {
+          let resolved = false;
+          const resolveOnce = () => {
+            if (!resolved) {
+              resolved = true;
+              resolve();
+            }
+          };
+
+          // Check immediately in case connection completed between check and listener setup
           if (this.clobService!.isConnected()) {
-            clearTimeout(timeout);
-            resolve();
+            console.log('[DipArb] ✅ CLOB WebSocket already connected');
+            resolveOnce();
             return;
           }
+
+          const timeout = setTimeout(() => {
+            console.log('[DipArb] ⚠️ CLOB WebSocket connection timeout after 10s');
+            // Try triggering another connect attempt
+            console.log('[DipArb] Triggering reconnect before continuing...');
+            this.clobService!.connect();
+            // Continue anyway - subscriptions will be queued and sent when connected
+            resolveOnce();
+          }, 10000);
 
           this.clobService!.once('connected', () => {
             clearTimeout(timeout);
             console.log('[DipArb] ✅ CLOB WebSocket connected');
-            resolve();
+            resolveOnce();
           });
         });
       }
@@ -3179,7 +3195,8 @@ export class DipArbService extends EventEmitter {
     const downPrice = this.downAsks[0]?.price ?? 0.5;
 
     if (upPrice > maxAsymmetry || downPrice > maxAsymmetry) {
-      this.log(`❌ Signal rejected: market too asymmetric (UP=${(upPrice * 100).toFixed(0)}%, DOWN=${(downPrice * 100).toFixed(0)}%) - wait for rotation`);
+      // Always log asymmetry rejections (critical for understanding why no trades)
+      console.log(`[DipArb] ❌ Signal rejected: market too asymmetric (UP=${(upPrice * 100).toFixed(0)}%, DOWN=${(downPrice * 100).toFixed(0)}%) - wait for rotation`);
       return false;
     }
 
@@ -3275,9 +3292,8 @@ export class DipArbService extends EventEmitter {
       const maxDropThreshold = this.config.maxRequiredLeg2Drop ?? 0.15;
 
       if (requiredDropPercent > maxDropThreshold) {
-        // Spread is too wide - Leg2 is mathematically unlikely
-        this.log(`❌ Signal rejected: leg2 needs ${(requiredDropPercent * 100).toFixed(1)}% drop (max ${(maxDropThreshold * 100).toFixed(0)}%) - spread too wide`);
-        this.log(`   Leg1: ${signal.targetPrice.toFixed(4)}, Opposite: ${bestOppositePrice.toFixed(4)}, maxLeg2: ${maxLeg2Price.toFixed(4)}`);
+        // Always log spread rejections (critical for understanding why no trades)
+        console.log(`[DipArb] ❌ Signal rejected: ${signal.dipSide} dip, but leg2 needs ${(requiredDropPercent * 100).toFixed(1)}% drop (max ${(maxDropThreshold * 100).toFixed(0)}%) - spread too wide`);
         // FIX #7: Emit signalRejected event
         this.emit('signalRejected', {
           reason: 'leg2SpreadTooWide',
@@ -3300,9 +3316,8 @@ export class DipArbService extends EventEmitter {
     // Verify signal meets minimum profit rate requirement
     const minProfitRate = this.config.minProfitRate ?? 0.02;
     if (signal.estimatedProfitRate < minProfitRate) {
-      if (this.config.debug) {
-        this.log(`❌ Signal rejected: profit ${(signal.estimatedProfitRate * 100).toFixed(2)}% < min ${(minProfitRate * 100).toFixed(0)}%`);
-      }
+      // Always log profit rejections (critical for understanding why no trades)
+      console.log(`[DipArb] ❌ Signal rejected: ${signal.dipSide} dip ${(signal.dropPercent * 100).toFixed(1)}%, but profit ${(signal.estimatedProfitRate * 100).toFixed(2)}% < min ${(minProfitRate * 100).toFixed(0)}% (cost=${signal.estimatedTotalCost.toFixed(4)})`);
       // FIX #7: Emit signalRejected event
       this.emit('signalRejected', {
         reason: 'lowProfitRate',

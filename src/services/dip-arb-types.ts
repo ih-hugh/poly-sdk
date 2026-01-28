@@ -353,7 +353,7 @@ export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
   sumTarget: 0.88,        // ⚡ AGGRESSIVE: ~12% gross = ~1.5% net after 6% fees (wider entry window)
   dipThreshold: 0.025,    // ⚡ AGGRESSIVE: 2.5% dip threshold catches momentum shifts
   windowMinutes: 15,      // ⚡ Full market duration (was 10)
-  slidingWindowMs: 2000,  // ⚡ LOWERED: 2 seconds for faster detection (was 3000)
+  slidingWindowMs: 1000,  // ⚡ AGGRESSIVE: 1 second for fastest detection (was 2000)
   maxSlippage: 0.02,
   minProfitRate: 0.02,    // ⚡ FIXED: Require 2% net profit minimum (was 0 = no check)
   leg2TimeoutSeconds: 180, // ⚡ AGGRESSIVE: 3min timeout reduces bleed from timeouts
@@ -361,10 +361,10 @@ export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
   surgeThreshold: 0.025,  // ⚡ Match dipThreshold (2.5%)
   autoMerge: true,
   autoExecute: true,      // ✅ MUST be true to actually trade!
-  executionCooldown: 500, // ⚡ FIX #4: Reduced from 2000ms for faster Leg2 execution
+  executionCooldown: 200, // ⚡ AGGRESSIVE: 200ms cooldown for maximum speed (was 500ms)
   splitOrders: 1,         // Don't split orders (avoids share errors)
   orderIntervalMs: 500,
-  debug: true,            // ⚡ ENABLED for troubleshooting (includes rotation logs)
+  debug: false,           // ⚡ Disabled to reduce log noise (enable for troubleshooting)
   // Paper trading - simulate trades without real orders
   paperMode: true,        // ✅ Default to paper mode - safe testing without real funds
   // Fee configuration

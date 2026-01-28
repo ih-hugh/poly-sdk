@@ -125,6 +125,13 @@ export type {
   EquityPriceHandlers,
 } from './services/realtime-service-v2.js';
 
+// CLOB WebSocket (new endpoint for orderbook data - replaces deprecated RTDS CLOB messages)
+export { ClobWebSocketService } from './services/clob-websocket-service.js';
+export type {
+  ClobWebSocketConfig,
+  ClobSubscription,
+} from './services/clob-websocket-service.js';
+
 // RealtimeService (legacy) has been removed - use RealtimeServiceV2 instead
 
 // ArbitrageService (Real-time arbitrage detection, execution, rebalancing, and settlement)
@@ -436,6 +443,7 @@ import { WalletService } from './services/wallet-service.js';
 import { MarketService } from './services/market-service.js';
 import { TradingService } from './services/trading-service.js';
 import { RealtimeServiceV2 } from './services/realtime-service-v2.js';
+import { ClobWebSocketService } from './services/clob-websocket-service.js';
 import { SmartMoneyService } from './services/smart-money-service.js';
 import { BinanceService } from './services/binance-service.js';
 import { DipArbService } from './services/dip-arb-service.js';
@@ -461,6 +469,7 @@ export class PolymarketSDK {
   public readonly wallets: WalletService;
   public readonly markets: MarketService;
   public readonly realtime: RealtimeServiceV2;
+  public readonly clobWs: ClobWebSocketService;  // NEW: CLOB WebSocket for orderbook
   public readonly smartMoney: SmartMoneyService;
   public readonly binance: BinanceService;
   public readonly dipArb: DipArbService;
@@ -495,6 +504,7 @@ export class PolymarketSDK {
     this.binance = new BinanceService(this.rateLimiter, this.cache);
     this.markets = new MarketService(this.gammaApi, this.dataApi, this.rateLimiter, this.cache, undefined, this.binance);
     this.realtime = new RealtimeServiceV2();
+    this.clobWs = new ClobWebSocketService();  // NEW: CLOB WebSocket for orderbook
     this.smartMoney = new SmartMoneyService(
       this.wallets,
       this.realtime,
@@ -512,7 +522,8 @@ export class PolymarketSDK {
       this.markets,
       config.privateKey,
       config.chainId,
-      this.binance // Inject BinanceService for momentum validation
+      this.binance, // Inject BinanceService for momentum validation
+      this.clobWs   // NEW: CLOB WebSocket for orderbook (replaces deprecated RTDS CLOB messages)
     );
 
     // Initialize DipArbManager for parallel multi-market trading
@@ -584,10 +595,11 @@ export class PolymarketSDK {
   }
 
   /**
-   * Connect to realtime WebSocket (required for smart money tracking)
+   * Connect to realtime WebSockets (required for smart money tracking and orderbook)
    */
   connect(): void {
-    this.realtime.connect();
+    this.realtime.connect();  // RTDS for Chainlink prices, activity
+    this.clobWs.connect();    // CLOB WebSocket for orderbook
   }
 
   /**
@@ -615,6 +627,7 @@ export class PolymarketSDK {
     this.dipArb.stop();
     this.smartMoney.disconnect();
     this.realtime.disconnect();
+    this.clobWs.disconnect();
   }
 
   /**
