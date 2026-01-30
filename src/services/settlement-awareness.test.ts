@@ -589,3 +589,225 @@ describe('Settlement Outcome Interface', () => {
     });
   });
 });
+
+describe('Binance Settlement Momentum', () => {
+  describe('Momentum Direction Logic', () => {
+    it('should return favorable when Binance rises for UP position', () => {
+      // For UP position: rising price = favorable momentum
+      const side: DipArbSide = 'UP';
+      const changePercent = 1.0; // 1% rise
+
+      const favorable = (side === 'UP' && changePercent > 0) ||
+                        (side === 'DOWN' && changePercent < 0);
+
+      expect(favorable).toBe(true);
+    });
+
+    it('should return unfavorable when Binance falls for UP position', () => {
+      // For UP position: falling price = unfavorable momentum
+      const side: DipArbSide = 'UP';
+      const changePercent = -1.0; // 1% fall
+
+      const favorable = (side === 'UP' && changePercent > 0) ||
+                        (side === 'DOWN' && changePercent < 0);
+
+      expect(favorable).toBe(false);
+    });
+
+    it('should return favorable when Binance falls for DOWN position', () => {
+      // For DOWN position: falling price = favorable momentum
+      const side: DipArbSide = 'DOWN';
+      const changePercent = -1.0; // 1% fall
+
+      const favorable = (side === 'UP' && changePercent > 0) ||
+                        (side === 'DOWN' && changePercent < 0);
+
+      expect(favorable).toBe(true);
+    });
+
+    it('should return unfavorable when Binance rises for DOWN position', () => {
+      // For DOWN position: rising price = unfavorable momentum
+      const side: DipArbSide = 'DOWN';
+      const changePercent = 1.0; // 1% rise
+
+      const favorable = (side === 'UP' && changePercent > 0) ||
+                        (side === 'DOWN' && changePercent < 0);
+
+      expect(favorable).toBe(false);
+    });
+  });
+
+  describe('Smart Exit Logic', () => {
+    it('should trigger smart exit when Binance strongly contradicts UP position', () => {
+      const side: DipArbSide = 'UP';
+      const changePercent = -0.5; // 0.5% fall (strong contradiction)
+      const smartExitThreshold = 0.3;
+      const smartExitEnabled = true;
+
+      const favorable = (side === 'UP' && changePercent > 0);
+      const strongContradiction = !favorable && Math.abs(changePercent) > smartExitThreshold;
+      const shouldTriggerSmartExit = smartExitEnabled && strongContradiction;
+
+      expect(shouldTriggerSmartExit).toBe(true);
+    });
+
+    it('should not trigger smart exit when contradiction is weak', () => {
+      const side: DipArbSide = 'UP';
+      const changePercent = -0.1; // 0.1% fall (weak contradiction)
+      const smartExitThreshold = 0.3;
+      const smartExitEnabled = true;
+
+      const favorable = (side === 'UP' && changePercent > 0);
+      const strongContradiction = !favorable && Math.abs(changePercent) > smartExitThreshold;
+      const shouldTriggerSmartExit = smartExitEnabled && strongContradiction;
+
+      expect(shouldTriggerSmartExit).toBe(false);
+    });
+
+    it('should not trigger smart exit when momentum is favorable', () => {
+      const side: DipArbSide = 'UP';
+      const changePercent = 0.5; // 0.5% rise (favorable)
+      const smartExitThreshold = 0.3;
+      const smartExitEnabled = true;
+
+      const favorable = (side === 'UP' && changePercent > 0);
+      const strongContradiction = !favorable && Math.abs(changePercent) > smartExitThreshold;
+      const shouldTriggerSmartExit = smartExitEnabled && strongContradiction;
+
+      expect(shouldTriggerSmartExit).toBe(false);
+    });
+
+    it('should not trigger smart exit when feature is disabled', () => {
+      const side: DipArbSide = 'UP';
+      const changePercent = -0.5; // Strong contradiction
+      const smartExitThreshold = 0.3;
+      const smartExitEnabled = false;
+
+      const favorable = (side === 'UP' && changePercent > 0);
+      const strongContradiction = !favorable && Math.abs(changePercent) > smartExitThreshold;
+      const shouldTriggerSmartExit = smartExitEnabled && strongContradiction;
+
+      expect(shouldTriggerSmartExit).toBe(false);
+    });
+  });
+
+  describe('Enhanced Decision with Binance Data', () => {
+    it('should include binanceMomentum in rule evaluations', () => {
+      const decision: EnhancedSettlementDecision = {
+        decision: 'EXIT',
+        reason: 'binance_contradiction',
+        confidence: 0.8,
+        ruleEvaluations: {
+          nearSettlement: { passed: false, timeToEndMin: 8, threshold: 3 },
+          highProbability: { passed: false, winProb: 0.45, threshold: 0.60 },
+          positiveEV: { passed: false, settlementEV: 45, exitValue: 40, evRatio: 1.125 },
+          chainlinkAligned: { passed: true, delta: 0.002, currentPrice: 95200, priceToBeat: 95000, side: 'UP' },
+          momentumFavorable: { passed: false, strength: 0, threshold: 0.3, enabled: true },
+          binanceMomentum: {
+            passed: false,
+            changePercent: -0.5,
+            favorable: false,
+            enabled: true,
+            reason: 'Binance BTCUSDT falling (-0.50%) - AGAINST UP',
+          },
+          smartExit: {
+            triggered: true,
+            reason: 'Binance -0.50% AGAINST UP',
+            threshold: 0.3,
+            enabled: true,
+          },
+        },
+        entryContext: {
+          leg1Side: 'UP',
+          leg1EntryPrice: 0.40,
+          leg1Shares: 100,
+          leg1Cost: 40,
+          enteredAt: Date.now() - 180000,
+        },
+        marketSnapshot: {
+          upPrice: 0.55,
+          downPrice: 0.48,
+          priceToBeat: 95000,
+          currentChainlinkPrice: 95200,
+          marketEndTime: Date.now() + 480000,
+        },
+        roundId: 'test-binance-exit',
+        marketName: 'btc-updown-15m-binance',
+        underlying: 'BTC',
+        isPaper: true,
+        timestamp: Date.now(),
+      };
+
+      // Verify Binance momentum is captured
+      expect(decision.ruleEvaluations.binanceMomentum).toBeDefined();
+      expect(decision.ruleEvaluations.binanceMomentum?.favorable).toBe(false);
+      expect(decision.ruleEvaluations.binanceMomentum?.changePercent).toBe(-0.5);
+
+      // Verify Smart Exit is captured
+      expect(decision.ruleEvaluations.smartExit).toBeDefined();
+      expect(decision.ruleEvaluations.smartExit?.triggered).toBe(true);
+
+      // Decision should be EXIT due to binance_contradiction
+      expect(decision.decision).toBe('EXIT');
+      expect(decision.reason).toBe('binance_contradiction');
+    });
+
+    it('should include binance_favorable as hold reason', () => {
+      const decision: EnhancedSettlementDecision = {
+        decision: 'HOLD',
+        reason: 'binance_favorable',
+        confidence: 0.7,
+        ruleEvaluations: {
+          nearSettlement: { passed: false, timeToEndMin: 8, threshold: 3 },
+          highProbability: { passed: false, winProb: 0.48, threshold: 0.60 },
+          positiveEV: { passed: false, settlementEV: 45, exitValue: 50, evRatio: 0.9 },
+          chainlinkAligned: { passed: true, delta: 0.005, currentPrice: 95500, priceToBeat: 95000, side: 'UP' },
+          momentumFavorable: { passed: false, strength: 0.2, threshold: 0.3, enabled: true },
+          binanceMomentum: {
+            passed: true,
+            changePercent: 1.2,
+            favorable: true,
+            enabled: true,
+            reason: 'Binance BTCUSDT rising (+1.20%) - favors UP',
+          },
+          smartExit: {
+            triggered: false,
+            reason: 'Binance momentum is favorable',
+            threshold: 0.3,
+            enabled: true,
+          },
+        },
+        entryContext: {
+          leg1Side: 'UP',
+          leg1EntryPrice: 0.40,
+          leg1Shares: 100,
+          leg1Cost: 40,
+          enteredAt: Date.now() - 180000,
+        },
+        marketSnapshot: {
+          upPrice: 0.52,
+          downPrice: 0.51,
+          priceToBeat: 95000,
+          currentChainlinkPrice: 95500,
+          marketEndTime: Date.now() + 480000,
+        },
+        roundId: 'test-binance-hold',
+        marketName: 'btc-updown-15m-binance-hold',
+        underlying: 'BTC',
+        isPaper: true,
+        timestamp: Date.now(),
+      };
+
+      // Verify Binance momentum is favorable
+      expect(decision.ruleEvaluations.binanceMomentum?.favorable).toBe(true);
+      expect(decision.ruleEvaluations.binanceMomentum?.changePercent).toBeGreaterThan(0);
+
+      // Smart Exit should not be triggered
+      expect(decision.ruleEvaluations.smartExit?.triggered).toBe(false);
+
+      // Decision should be HOLD due to binance_favorable
+      expect(decision.decision).toBe('HOLD');
+      expect(decision.reason).toBe('binance_favorable');
+    });
+  });
+});
