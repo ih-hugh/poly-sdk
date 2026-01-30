@@ -3066,7 +3066,13 @@ export class DipArbService extends EventEmitter {
       if (elapsed > this.getLeg2TimeoutSeconds()) {
         // ✅ Settlement Awareness: Get enhanced decision with full rule evaluations
         const enhancedDecision = this.getEnhancedSettlementDecision();
-        const holdDecision = this.shouldHoldForSettlement();
+        // Use async version that consults real-time Binance data for settlement decisions
+        const holdDecision = await this.shouldHoldForSettlementAsync();
+
+        // Log Binance data for observability when available
+        if (holdDecision.binanceData) {
+          this.log(`📊 Binance momentum: ${holdDecision.binanceData.changePercent.toFixed(2)}% (${holdDecision.binanceData.favorable ? 'favorable' : 'AGAINST'})`);
+        }
 
         // Calculate metrics for settlement decision event
         const timeToEndMin = this.market
