@@ -856,6 +856,7 @@ export class DipArbService extends EventEmitter {
 
     // Connect realtime service with retry logic
     console.log(`[DipArb] Config state: debug=${this.config.debug}, paperMode=${this.config.paperMode}`);
+    console.log(`[DipArb] Settlement intelligence: binanceService=${this.binanceService ? 'YES' : 'NO'}, enableSettlementMomentum=${this.config.enableSettlementMomentum}, enableSmartExit=${this.config.enableSmartExit}`);
     console.log(`[DipArb] Connecting to WebSocket...`);
     this.realtimeService.connect();
 
@@ -5665,6 +5666,7 @@ export class DipArbService extends EventEmitter {
   }> {
     // Fallback to Chainlink proxy if Binance not available
     if (!this.binanceService || !this.market?.underlying) {
+      this.log(`⚠️ Settlement momentum: Using Chainlink fallback (binanceService=${!!this.binanceService}, underlying=${this.market?.underlying})`);
       const chainlink = this.checkChainlinkAlignment(side);
       return {
         favorable: chainlink.aligned,
