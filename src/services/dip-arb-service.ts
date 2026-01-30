@@ -5794,6 +5794,115 @@ export class DipArbService extends EventEmitter {
   }
 
   /**
+   * Async version of shouldHoldForSettlement that uses real Binance data
+   *
+   * This method should be called from async contexts (like timeout handlers)
+   * where we have time to make the Binance API call. It includes the "Smart Exit"
+   * feature that exits when Binance momentum strongly contradicts our position.
+   *
+   * @returns Decision object with hold boolean, reason, confidence, and optional Binance data
+   */
+  private async shouldHoldForSettlementAsync(): Promise<{
+    hold: boolean;
+    reason: string;
+    confidence: number;
+    binanceData?: { changePercent: number; favorable: boolean };
+  }> {
+    // Check if settlement awareness is enabled
+    if (!this.config.favorSettlement) {
+      return { hold: false, reason: 'disabled', confidence: 0 };
+    }
+
+    // Check if we have a valid position
+    if (!this.market || !this.currentRound?.leg1) {
+      return { hold: false, reason: 'no_position', confidence: 0 };
+    }
+
+    const leg1 = this.currentRound.leg1;
+    const now = Date.now();
+    const endTime = this.market.endTime instanceof Date
+      ? this.market.endTime.getTime()
+      : (typeof this.market.endTime === 'number' ? this.market.endTime : new Date(this.market.endTime).getTime());
+    const timeToEndMin = (endTime - now) / 60000;
+
+    // RULE 1: Always hold if very close to market end (< 3 min default)
+    const minTimeToEnd = this.config.minTimeToEndForHold ?? 3;
+    if (timeToEndMin > 0 && timeToEndMin < minTimeToEnd) {
+      return { hold: true, reason: 'near_settlement', confidence: 0.9 };
+    }
+
+    // Don't hold if market has already ended
+    if (timeToEndMin <= 0) {
+      return { hold: false, reason: 'market_ended', confidence: 0 };
+    }
+
+    // RULE 2: Check win probability with HIGHER threshold (60% default)
+    const winProb = this.getPositionWinProbability(leg1.side);
+    const threshold = this.config.settlementHoldThreshold ?? 0.60; // Raised from 0.50
+
+    // NEW RULE: Check Binance momentum BEFORE making hold decision
+    let binanceData: { changePercent: number; favorable: boolean } | undefined;
+    if (this.config.enableSettlementMomentum) {
+      const binanceMomentum = await this.checkBinanceSettlementMomentum(leg1.side);
+      binanceData = {
+        changePercent: binanceMomentum.binanceChangePercent,
+        favorable: binanceMomentum.favorable
+      };
+
+      // SMART EXIT: If Binance strongly contradicts our position, EXIT NOW
+      const smartExitEnabled = this.config.enableSmartExit ?? true;
+      const smartExitThreshold = this.config.smartExitThreshold ?? 0.3;
+      const strongContradiction = !binanceMomentum.favorable &&
+        Math.abs(binanceMomentum.binanceChangePercent) > smartExitThreshold;
+
+      if (smartExitEnabled && strongContradiction) {
+        this.log(`🚨 SMART EXIT: ${binanceMomentum.reason}`);
+        return {
+          hold: false,
+          reason: 'binance_contradiction',
+          confidence: binanceMomentum.strength,
+          binanceData
+        };
+      }
+
+      // If Binance favorable AND win probability decent, hold
+      if (binanceMomentum.favorable && winProb >= 0.45) {
+        return {
+          hold: true,
+          reason: 'binance_favorable',
+          confidence: Math.max(winProb, binanceMomentum.strength),
+          binanceData
+        };
+      }
+    }
+
+    // RULE 2 (continued): High probability threshold
+    if (winProb >= threshold) {
+      return { hold: true, reason: 'high_probability', confidence: winProb, binanceData };
+    }
+
+    // RULE 3: Expected value comparison
+    const expectedSettleValue = this.calculateSettlementExpectedValue(leg1);
+    const exitValue = this.getCurrentExitValue(leg1);
+
+    if (expectedSettleValue > exitValue && exitValue > 0) {
+      const evRatio = expectedSettleValue / exitValue;
+      return { hold: true, reason: 'positive_ev', confidence: Math.min(evRatio - 1, 0.5), binanceData };
+    }
+
+    // RULE 4: Chainlink alignment (only if Binance not available/enabled)
+    if (!this.config.enableSettlementMomentum) {
+      const chainlink = this.checkChainlinkAlignment(leg1.side);
+      if (chainlink.aligned && Math.abs(chainlink.delta) > 0.001) {
+        return { hold: true, reason: 'chainlink_aligned', confidence: 0.6 };
+      }
+    }
+
+    // No conditions met - don't hold
+    return { hold: false, reason: 'no_edge', confidence: 0, binanceData };
+  }
+
+  /**
    * Enhanced version of shouldHoldForSettlement that returns full rule evaluations
    *
    * This method computes all rule evaluations upfront and includes them in the result,
