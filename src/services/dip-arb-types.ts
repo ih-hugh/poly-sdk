@@ -310,7 +310,7 @@ export interface DipArbServiceConfig {
   /**
    * Enable Binance momentum validation for settlement decisions
    * When enabled, uses real-time Binance data to validate hold decisions
-   * @default false
+   * @default true
    */
   enableSettlementMomentum?: boolean;
 
@@ -320,6 +320,20 @@ export interface DipArbServiceConfig {
    * @default 0.3
    */
   settlementMomentumThreshold?: number;
+
+  /**
+   * Enable Smart Exit feature
+   * When Binance momentum strongly contradicts position, exit immediately
+   * instead of holding to settlement
+   * @default true
+   */
+  enableSmartExit?: boolean;
+
+  /**
+   * Threshold for Smart Exit trigger (% Binance movement against position)
+   * @default 0.3 (0.3% movement against position triggers exit)
+   */
+  smartExitThreshold?: number;
 
   // ============= P1.1: Chainlink Momentum Configuration =============
 
@@ -551,11 +565,13 @@ export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
   maxRequiredLeg2Drop: 0.15,            // ⚡ NEW: Max 15% drop required for Leg2 profitability
   // Settlement awareness configuration
   favorSettlement: true,                // ✅ Enable smart settlement logic
-  settlementHoldThreshold: 0.50,        // 50% win probability threshold (conservative)
+  settlementHoldThreshold: 0.60,        // ⚡ RAISED: 60% win probability threshold (was 50%)
   minTimeToEndForHold: 3,               // Always hold if <3 min to market end
   settlementWaitBuffer: 300,            // 5 min buffer after market end
-  enableSettlementMomentum: false,      // Momentum validation off by default
+  enableSettlementMomentum: true,       // ⚡ ENABLED: Use real Binance data for settlement decisions
   settlementMomentumThreshold: 0.3,     // 30% momentum strength threshold
+  enableSmartExit: true,                // ⚡ NEW: Exit when Binance contradicts position
+  smartExitThreshold: 0.3,              // 0.3% Binance movement against position triggers exit
   // P1.1: Chainlink momentum validation (replaces Binance momentum)
   enableChainlinkMomentum: true,        // ✅ Enable Chainlink momentum check for Leg1
   chainlinkMomentumWindowSec: 30,       // 30 second lookback

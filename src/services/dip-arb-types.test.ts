@@ -49,8 +49,8 @@ describe('DipArb Types', () => {
       // Settlement awareness should be enabled by default
       expect(DEFAULT_DIP_ARB_CONFIG.favorSettlement).toBe(true);
 
-      // Conservative threshold (50%)
-      expect(DEFAULT_DIP_ARB_CONFIG.settlementHoldThreshold).toBe(0.50);
+      // Higher threshold (60%) to avoid gambling on marginal positions
+      expect(DEFAULT_DIP_ARB_CONFIG.settlementHoldThreshold).toBe(0.60);
 
       // Always hold if <3 min to market end
       expect(DEFAULT_DIP_ARB_CONFIG.minTimeToEndForHold).toBe(3);
@@ -58,8 +58,12 @@ describe('DipArb Types', () => {
       // 5 min buffer after market end
       expect(DEFAULT_DIP_ARB_CONFIG.settlementWaitBuffer).toBe(300);
 
-      // Momentum validation disabled by default
-      expect(DEFAULT_DIP_ARB_CONFIG.enableSettlementMomentum).toBe(false);
+      // Binance momentum validation enabled for settlement decisions
+      expect(DEFAULT_DIP_ARB_CONFIG.enableSettlementMomentum).toBe(true);
+
+      // Smart Exit enabled by default
+      expect(DEFAULT_DIP_ARB_CONFIG.enableSmartExit).toBe(true);
+      expect(DEFAULT_DIP_ARB_CONFIG.smartExitThreshold).toBe(0.3);
       expect(DEFAULT_DIP_ARB_CONFIG.settlementMomentumThreshold).toBe(0.3);
     });
   });

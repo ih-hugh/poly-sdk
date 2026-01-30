@@ -48,8 +48,8 @@ describe('Settlement Awareness Logic', () => {
       expect(DEFAULT_DIP_ARB_CONFIG.favorSettlement).toBe(true);
     });
 
-    it('should have conservative hold threshold of 50%', () => {
-      expect(DEFAULT_DIP_ARB_CONFIG.settlementHoldThreshold).toBe(0.50);
+    it('should have 60% hold threshold to avoid gambling on marginal positions', () => {
+      expect(DEFAULT_DIP_ARB_CONFIG.settlementHoldThreshold).toBe(0.60);
     });
 
     it('should always hold if less than 3 minutes to market end', () => {
@@ -60,8 +60,13 @@ describe('Settlement Awareness Logic', () => {
       expect(DEFAULT_DIP_ARB_CONFIG.settlementWaitBuffer).toBe(300);
     });
 
-    it('should have momentum validation disabled by default', () => {
-      expect(DEFAULT_DIP_ARB_CONFIG.enableSettlementMomentum).toBe(false);
+    it('should have Binance momentum validation enabled by default', () => {
+      expect(DEFAULT_DIP_ARB_CONFIG.enableSettlementMomentum).toBe(true);
+    });
+
+    it('should have Smart Exit enabled by default', () => {
+      expect(DEFAULT_DIP_ARB_CONFIG.enableSmartExit).toBe(true);
+      expect(DEFAULT_DIP_ARB_CONFIG.smartExitThreshold).toBe(0.3);
     });
   });
 
