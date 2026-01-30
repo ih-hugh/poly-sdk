@@ -5642,6 +5642,80 @@ export class DipArbService extends EventEmitter {
   }
 
   /**
+   * Check real-time Binance momentum for settlement hold decision
+   *
+   * Unlike the sync version, this actually calls Binance API for real-time data.
+   * Use this in async contexts (like timeout handlers) where we have time to
+   * make the API call.
+   *
+   * @param side - The position side (UP or DOWN)
+   * @returns Object with favorable status, momentum strength, and reason
+   */
+  private async checkBinanceSettlementMomentum(side: DipArbSide): Promise<{
+    favorable: boolean;
+    strength: number;
+    binanceChangePercent: number;
+    reason: string;
+  }> {
+    // Fallback to Chainlink proxy if Binance not available
+    if (!this.binanceService || !this.market?.underlying) {
+      const chainlink = this.checkChainlinkAlignment(side);
+      return {
+        favorable: chainlink.aligned,
+        strength: Math.min(Math.abs(chainlink.delta), 0.01) / 0.01,
+        binanceChangePercent: 0,
+        reason: 'Using Chainlink proxy (Binance unavailable)',
+      };
+    }
+
+    const binanceSymbol = UNDERLYING_TO_BINANCE[this.market.underlying];
+    if (!binanceSymbol) {
+      const chainlink = this.checkChainlinkAlignment(side);
+      return {
+        favorable: chainlink.aligned,
+        strength: Math.min(Math.abs(chainlink.delta), 0.01) / 0.01,
+        binanceChangePercent: 0,
+        reason: `No Binance symbol for ${this.market.underlying}`,
+      };
+    }
+
+    try {
+      const windowMs = this.config.binanceMomentumWindowMs ?? 60000;
+      const startTime = Date.now() - windowMs;
+
+      const priceChange = await this.binanceService.getPriceChange(
+        binanceSymbol,
+        startTime
+      );
+
+      // For settlement: UP wins if price rises, DOWN wins if price falls
+      // So momentum is favorable if it matches our position's win direction
+      const favorable = (side === 'UP' && priceChange.changePercent > 0) ||
+                        (side === 'DOWN' && priceChange.changePercent < 0);
+
+      // Strength is the absolute magnitude of movement (cap at 2% = strength 1.0)
+      const strength = Math.min(Math.abs(priceChange.changePercent) / 2, 1);
+
+      const direction = priceChange.changePercent >= 0 ? 'rising' : 'falling';
+      const reason = favorable
+        ? `Binance ${binanceSymbol} ${direction} (${priceChange.changePercent.toFixed(2)}%) - favors ${side}`
+        : `Binance ${binanceSymbol} ${direction} (${priceChange.changePercent.toFixed(2)}%) - AGAINST ${side}`;
+
+      return { favorable, strength, binanceChangePercent: priceChange.changePercent, reason };
+    } catch (error) {
+      this.log(`⚠️ Binance settlement momentum check failed: ${error}`);
+      // Fallback to Chainlink
+      const chainlink = this.checkChainlinkAlignment(side);
+      return {
+        favorable: chainlink.aligned,
+        strength: Math.min(Math.abs(chainlink.delta), 0.01) / 0.01,
+        binanceChangePercent: 0,
+        reason: 'Binance error, using Chainlink proxy',
+      };
+    }
+  }
+
+  /**
    * Core decision method: Should we hold for settlement instead of timeout exit?
    *
    * Evaluates multiple factors:
