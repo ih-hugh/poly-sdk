@@ -6053,6 +6053,198 @@ export class DipArbService extends EventEmitter {
     };
   }
 
+  /**
+   * Async version of getEnhancedSettlementDecision with real Binance data
+   *
+   * This method includes Binance momentum and Smart Exit evaluations
+   * for complete observability of settlement decisions.
+   *
+   * @returns EnhancedSettlementDecision with Binance data, or null if no position
+   */
+  public async getEnhancedSettlementDecisionAsync(): Promise<EnhancedSettlementDecision | null> {
+    // Need valid position for enhanced decision
+    if (!this.market || !this.currentRound?.leg1) {
+      return null;
+    }
+
+    const leg1 = this.currentRound.leg1;
+    const now = Date.now();
+    const endTime = this.market.endTime instanceof Date
+      ? this.market.endTime.getTime()
+      : (typeof this.market.endTime === 'number' ? this.market.endTime : new Date(this.market.endTime).getTime());
+    const timeToEndMin = (endTime - now) / 60000;
+
+    // Get current prices
+    const upPrice = this.upAsks[0]?.price ?? 0.5;
+    const downPrice = this.downAsks[0]?.price ?? 0.5;
+    const currentChainlinkPrice = this.currentUnderlyingPrice ?? this.market.priceToBeat ?? 0;
+
+    // Config thresholds
+    const minTimeToEnd = this.config.minTimeToEndForHold ?? 3;
+    const probThreshold = this.config.settlementHoldThreshold ?? 0.60;
+    const momentumThreshold = this.config.settlementMomentumThreshold ?? 0.3;
+    const smartExitThreshold = this.config.smartExitThreshold ?? 0.3;
+    const smartExitEnabled = this.config.enableSmartExit ?? true;
+
+    // Compute all rule evaluations
+    const winProb = this.getPositionWinProbability(leg1.side);
+    const expectedSettleValue = this.calculateSettlementExpectedValue(leg1);
+    const exitValue = this.getCurrentExitValue(leg1);
+    const evRatio = exitValue > 0 ? expectedSettleValue / exitValue : 0;
+    const chainlink = this.checkChainlinkAlignment(leg1.side);
+    const momentum = this.checkSettlementMomentum(leg1.side);
+
+    // Get Binance momentum (async)
+    const binanceMomentum = this.config.enableSettlementMomentum
+      ? await this.checkBinanceSettlementMomentum(leg1.side)
+      : null;
+
+    // Check smart exit condition
+    const smartExitTriggered = smartExitEnabled &&
+      binanceMomentum !== null &&
+      !binanceMomentum.favorable &&
+      Math.abs(binanceMomentum.binanceChangePercent) > smartExitThreshold;
+
+    // Build rule evaluations with Binance data
+    const ruleEvaluations: SettlementRuleEvaluations = {
+      nearSettlement: {
+        passed: timeToEndMin > 0 && timeToEndMin < minTimeToEnd,
+        timeToEndMin,
+        threshold: minTimeToEnd,
+      },
+      highProbability: {
+        passed: winProb >= probThreshold,
+        winProb,
+        threshold: probThreshold,
+      },
+      positiveEV: {
+        passed: expectedSettleValue > exitValue && exitValue > 0,
+        settlementEV: expectedSettleValue,
+        exitValue,
+        evRatio,
+      },
+      chainlinkAligned: {
+        passed: chainlink.aligned && Math.abs(chainlink.delta) > 0.001,
+        delta: chainlink.delta,
+        currentPrice: currentChainlinkPrice,
+        priceToBeat: this.market.priceToBeat ?? 0,
+        side: leg1.side,
+      },
+      momentumFavorable: {
+        passed: this.config.enableSettlementMomentum && momentum.favorable && momentum.strength > momentumThreshold,
+        strength: momentum.strength,
+        threshold: momentumThreshold,
+        enabled: this.config.enableSettlementMomentum ?? false,
+      },
+      // Binance momentum evaluation
+      binanceMomentum: binanceMomentum ? {
+        passed: binanceMomentum.favorable,
+        changePercent: binanceMomentum.binanceChangePercent,
+        favorable: binanceMomentum.favorable,
+        enabled: this.config.enableSettlementMomentum ?? false,
+        reason: binanceMomentum.reason,
+      } : undefined,
+      // Smart exit evaluation
+      smartExit: {
+        triggered: smartExitTriggered,
+        reason: smartExitTriggered
+          ? `Binance ${binanceMomentum?.binanceChangePercent.toFixed(2)}% AGAINST ${leg1.side}`
+          : binanceMomentum === null
+            ? 'Binance momentum not enabled'
+            : binanceMomentum.favorable
+              ? 'Binance momentum is favorable'
+              : `Movement (${Math.abs(binanceMomentum.binanceChangePercent).toFixed(2)}%) below threshold`,
+        threshold: smartExitThreshold,
+        enabled: smartExitEnabled,
+      },
+    };
+
+    // Build entry context
+    const entryContext: SettlementEntryContext = {
+      leg1Side: leg1.side,
+      leg1EntryPrice: leg1.price,
+      leg1Shares: leg1.shares,
+      leg1Cost: leg1.price * leg1.shares,
+      enteredAt: leg1.timestamp,
+    };
+
+    // Build market snapshot
+    const marketSnapshot: SettlementMarketSnapshot = {
+      upPrice,
+      downPrice,
+      priceToBeat: this.market.priceToBeat ?? 0,
+      currentChainlinkPrice,
+      marketEndTime: endTime,
+    };
+
+    // Determine decision and reason based on rule priority
+    let decision: 'HOLD' | 'EXIT' = 'EXIT';
+    let reason: EnhancedSettlementDecision['reason'] = 'no_edge';
+    let confidence = 0;
+
+    // Check if feature is disabled
+    if (!this.config.favorSettlement) {
+      decision = 'EXIT';
+      reason = 'disabled';
+      confidence = 0;
+    }
+    // Check for market ended
+    else if (timeToEndMin <= 0) {
+      decision = 'EXIT';
+      reason = 'market_ended';
+      confidence = 0;
+    }
+    // SMART EXIT: Binance contradicts our position strongly
+    else if (smartExitTriggered) {
+      decision = 'EXIT';
+      reason = 'binance_contradiction';
+      confidence = binanceMomentum?.strength ?? 0;
+    }
+    // Priority order for HOLD reasons
+    else if (ruleEvaluations.nearSettlement.passed) {
+      decision = 'HOLD';
+      reason = 'near_settlement';
+      confidence = 0.9;
+    }
+    // Binance favorable with decent win probability
+    else if (binanceMomentum?.favorable && winProb >= 0.45) {
+      decision = 'HOLD';
+      reason = 'binance_favorable';
+      confidence = Math.max(winProb, binanceMomentum.strength);
+    }
+    else if (ruleEvaluations.highProbability.passed) {
+      decision = 'HOLD';
+      reason = 'high_probability';
+      confidence = winProb;
+    } else if (ruleEvaluations.positiveEV.passed) {
+      decision = 'HOLD';
+      reason = 'positive_ev';
+      confidence = Math.min(evRatio - 1, 0.5);
+    } else if (ruleEvaluations.chainlinkAligned.passed && !this.config.enableSettlementMomentum) {
+      decision = 'HOLD';
+      reason = 'chainlink_aligned';
+      confidence = 0.6;
+    } else if (ruleEvaluations.momentumFavorable.passed) {
+      decision = 'HOLD';
+      reason = 'momentum_favorable';
+      confidence = momentum.strength;
+    }
+
+    return {
+      decision,
+      reason,
+      confidence,
+      ruleEvaluations,
+      entryContext,
+      marketSnapshot,
+      roundId: this.currentRound.roundId,
+      marketName: this.market.name,
+      underlying: this.market.underlying,
+      isPaper: this.config.paperMode ?? true,
+      timestamp: now,
+    };
+  }
+
   // ===== Settlement Outcome Tracking =====
 
   /** Map of pending settlement decisions awaiting outcome reconciliation */

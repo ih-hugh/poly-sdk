@@ -1108,6 +1108,34 @@ export interface MomentumEvaluation extends SettlementRuleEvaluation {
 }
 
 /**
+ * Binance momentum evaluation for settlement decisions
+ */
+export interface BinanceMomentumEvaluation extends SettlementRuleEvaluation {
+  /** Binance price change percentage */
+  changePercent: number;
+  /** Whether momentum favors our position */
+  favorable: boolean;
+  /** Whether Binance momentum check is enabled */
+  enabled: boolean;
+  /** Human-readable reason */
+  reason: string;
+}
+
+/**
+ * Smart Exit evaluation
+ */
+export interface SmartExitEvaluation {
+  /** Whether smart exit was triggered */
+  triggered: boolean;
+  /** Reason for trigger/no-trigger */
+  reason: string;
+  /** Smart exit threshold from config */
+  threshold: number;
+  /** Whether smart exit is enabled */
+  enabled: boolean;
+}
+
+/**
  * All rule evaluations for a settlement decision
  */
 export interface SettlementRuleEvaluations {
@@ -1116,6 +1144,10 @@ export interface SettlementRuleEvaluations {
   positiveEV: PositiveEVEvaluation;
   chainlinkAligned: ChainlinkAlignedEvaluation;
   momentumFavorable: MomentumEvaluation;
+  /** Binance momentum evaluation (only populated in async version) */
+  binanceMomentum?: BinanceMomentumEvaluation;
+  /** Smart exit evaluation (only populated in async version) */
+  smartExit?: SmartExitEvaluation;
 }
 
 /**
@@ -1159,6 +1191,8 @@ export interface EnhancedSettlementDecision {
     | 'positive_ev'
     | 'chainlink_aligned'
     | 'momentum_favorable'
+    | 'binance_favorable'
+    | 'binance_contradiction'
     | 'no_edge';
   /** Confidence level (0-1) */
   confidence: number;
