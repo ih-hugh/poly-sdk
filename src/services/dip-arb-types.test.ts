@@ -37,7 +37,8 @@ describe('DipArb Types', () => {
       expect(DEFAULT_DIP_ARB_CONFIG.maxOpenPositions).toBe(25);
 
       // Profitability parameters (Settlement Hunter config)
-      expect(DEFAULT_DIP_ARB_CONFIG.sumTarget).toBe(0.88);
+      // P0.2: sumTarget tightened from 0.88 to 0.86 for better net profit (~7.5% instead of ~5.5%)
+      expect(DEFAULT_DIP_ARB_CONFIG.sumTarget).toBe(0.86);
       expect(DEFAULT_DIP_ARB_CONFIG.dipThreshold).toBe(0.025);
 
       // Paper mode should be default (safe)

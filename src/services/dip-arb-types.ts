@@ -320,6 +320,171 @@ export interface DipArbServiceConfig {
    * @default 0.3
    */
   settlementMomentumThreshold?: number;
+
+  // ============= P1.1: Chainlink Momentum Configuration =============
+
+  /**
+   * P1.1: Enable Chainlink momentum validation for Leg1 signals
+   * When enabled, validates that underlying price movement supports the dip direction
+   * Uses historical Chainlink prices instead of Binance (which may be geofenced)
+   * @default true
+   */
+  enableChainlinkMomentum?: boolean;
+
+  /**
+   * P1.1: Time window for Chainlink momentum check (in seconds)
+   * Compares current price vs price N seconds ago
+   * @default 30
+   */
+  chainlinkMomentumWindowSec?: number;
+
+  /**
+   * P1.1: Minimum Chainlink price change to confirm momentum
+   * Percentage change required to validate dip direction
+   * @default 0.001 (0.1%)
+   */
+  chainlinkMomentumThreshold?: number;
+
+  /**
+   * P1.1: Require Chainlink momentum confirmation for Leg1
+   * If true, Leg1 signals are rejected without momentum confirmation
+   * If false, momentum check is advisory only (logged but not blocking)
+   * @default false
+   */
+  requireChainlinkMomentum?: boolean;
+
+  // ============= P1.3: Two-Tier Early Entry Configuration =============
+
+  /**
+   * P1.3: Enable two-tier early entry system
+   * When enabled, enters 50% position at tier1 threshold with momentum confirmation,
+   * then adds remaining 50% at full threshold (tier2)
+   * @default false
+   */
+  enableTieredEntry?: boolean;
+
+  /**
+   * P1.3: Tier 1 dip threshold (early entry)
+   * Enter with partial position when dip reaches this threshold
+   * Must be lower than main dipThreshold
+   * @default 0.015 (1.5%)
+   */
+  tier1DipThreshold?: number;
+
+  /**
+   * P1.3: Share ratio for Tier 1 entry
+   * Portion of total shares to enter at Tier 1
+   * Remaining shares enter at Tier 2 (full dipThreshold)
+   * @default 0.5 (50%)
+   */
+  tier1ShareRatio?: number;
+
+  /**
+   * P1.3: Require momentum confirmation for Tier 1 entry
+   * If true, Tier 1 entry only triggers if momentum aligns
+   * Tier 2 does not require momentum (uses existing dipThreshold logic)
+   * @default true
+   */
+  requireMomentumForTier1?: boolean;
+
+  // ============= P2.1: Order Flow Analysis Configuration =============
+
+  /**
+   * P2.1: Enable order flow analysis for predictive entry
+   * When enabled, monitors orderbook microstructure to detect sell pressure
+   * before price actually moves, generating predictive signals
+   * @default false
+   */
+  enableOrderFlowPrediction?: boolean;
+
+  /**
+   * P2.1: Imbalance ratio threshold to trigger predictive signal
+   * imbalanceRatio = (bidPressure - askPressure) / (bidPressure + askPressure)
+   * Negative values indicate sell pressure (more asks than bids)
+   * @default -0.33 (ask pressure > bid pressure by 50%)
+   */
+  orderFlowImbalanceThreshold?: number;
+
+  /**
+   * P2.1: Share ratio for predictive (lower confidence) signals
+   * Predictive signals use reduced position size due to lower certainty
+   * @default 0.3 (30% of normal shares)
+   */
+  predictiveShareRatio?: number;
+
+  /**
+   * P2.1: Minimum depth on top levels to consider for pressure calculation
+   * Sum of sizes on top N levels of each side
+   * @default 3 (top 3 levels)
+   */
+  orderFlowDepthLevels?: number;
+
+  /**
+   * P2.1: Time window to detect spread widening (ms)
+   * If spread increased within this window, may indicate impending move
+   * @default 500
+   */
+  spreadWideningWindowMs?: number;
+
+  /**
+   * P2.1: Minimum value for large cancellation detection
+   * Cancelled bids above this size (in USD) are significant
+   * @default 500
+   */
+  largeCancellationThreshold?: number;
+
+  // ============= P2.2: Dynamic Fee Optimization Configuration =============
+
+  /**
+   * P2.2: Enable maker orders for Leg2 to reduce fees
+   * When enabled, attempts to use limit orders before falling back to market
+   * @default false
+   */
+  enableMakerOrders?: boolean;
+
+  /**
+   * P2.2: Minimum time (seconds) until timeout to attempt maker order
+   * Only attempts limit order if enough time remains
+   * @default 60
+   */
+  minTimeForMakerOrder?: number;
+
+  /**
+   * P2.2: Price improvement for maker order (inside spread)
+   * Places limit order at bestAsk * (1 - makerPriceImprovement)
+   * @default 0.001 (0.1% inside spread)
+   */
+  makerPriceImprovement?: number;
+
+  /**
+   * P2.2: Maximum wait time (seconds) for maker order to fill
+   * If not filled within this time, converts to market order
+   * @default 30
+   */
+  makerOrderTimeout?: number;
+
+  // ============= P2.3: High-Probability Timeout Extension Configuration =============
+
+  /**
+   * P2.3: Enable holding positions for settlement when probability is high
+   * When enabled, extends timeout for high-probability positions near settlement
+   * @default false
+   */
+  enableSettlementHoldExtension?: boolean;
+
+  /**
+   * P2.3: Minimum win probability to hold for settlement
+   * Only holds if estimated win probability exceeds this threshold
+   * @default 0.70 (70%)
+   */
+  settlementExtensionWinProbThreshold?: number;
+
+  /**
+   * P2.3: Maximum time to settlement (minutes) to consider holding
+   * Only holds if market ends within this time window
+   * @default 5
+   */
+  settlementExtensionMaxMinutes?: number;
 }
 
 /**
@@ -350,7 +515,7 @@ export const DIP_ARB_CRYPTO_TAKER_FEE = 0.03;
  */
 export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
   shares: 50,             // ⚡ Increased from 20 for more capital deployment
-  sumTarget: 0.88,        // ⚡ AGGRESSIVE: ~12% gross = ~1.5% net after 6% fees (wider entry window)
+  sumTarget: 0.86,        // P0.2: Tightened from 0.88 → 0.86 (~14% gross = ~7.5% net after 6% fees)
   dipThreshold: 0.025,    // ⚡ AGGRESSIVE: 2.5% dip threshold catches momentum shifts
   windowMinutes: 15,      // ⚡ Full market duration (was 10)
   slidingWindowMs: 1000,  // ⚡ AGGRESSIVE: 1 second for fastest detection (was 2000)
@@ -391,6 +556,32 @@ export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
   settlementWaitBuffer: 300,            // 5 min buffer after market end
   enableSettlementMomentum: false,      // Momentum validation off by default
   settlementMomentumThreshold: 0.3,     // 30% momentum strength threshold
+  // P1.1: Chainlink momentum validation (replaces Binance momentum)
+  enableChainlinkMomentum: true,        // ✅ Enable Chainlink momentum check for Leg1
+  chainlinkMomentumWindowSec: 30,       // 30 second lookback
+  chainlinkMomentumThreshold: 0.001,    // 0.1% minimum price change
+  requireChainlinkMomentum: false,      // Advisory by default (logged but not blocking)
+  // P1.3: Two-tier early entry system
+  enableTieredEntry: false,             // Disabled by default - enable for early entry
+  tier1DipThreshold: 0.015,             // 1.5% dip threshold for early entry
+  tier1ShareRatio: 0.5,                 // 50% of shares at Tier 1
+  requireMomentumForTier1: true,        // Require momentum for Tier 1 entry
+  // P2.1: Order flow analysis for predictive entry
+  enableOrderFlowPrediction: false,     // Disabled by default - experimental
+  orderFlowImbalanceThreshold: -0.33,   // Ask pressure > bid by 50% triggers signal
+  predictiveShareRatio: 0.3,            // 30% of normal shares for predictive signals
+  orderFlowDepthLevels: 3,              // Sum top 3 levels for pressure calculation
+  spreadWideningWindowMs: 500,          // 500ms window for spread widening detection
+  largeCancellationThreshold: 500,      // $500 minimum for significant cancellation
+  // P2.2: Dynamic fee optimization (maker orders)
+  enableMakerOrders: false,             // Disabled by default - requires more testing
+  minTimeForMakerOrder: 60,             // Need 60s+ remaining to attempt maker
+  makerPriceImprovement: 0.001,         // 0.1% inside spread
+  makerOrderTimeout: 30,                // 30s wait before converting to market
+  // P2.3: High-probability timeout extension
+  enableSettlementHoldExtension: false, // Disabled by default
+  settlementExtensionWinProbThreshold: 0.70, // 70% win prob threshold
+  settlementExtensionMaxMinutes: 5,     // Only hold if <5min to settlement
 };
 
 // ============= Market Configuration =============
@@ -531,6 +722,121 @@ export interface DipArbRoundState {
   profit?: number;
 }
 
+// ============= P1.1: Chainlink Momentum =============
+
+/**
+ * P1.1: Result of Chainlink momentum check
+ * Used to validate dip direction against underlying price movement
+ */
+export interface ChainlinkMomentumResult {
+  /** Whether momentum confirms the signal direction */
+  confirmed: boolean;
+  /** Direction of underlying price movement */
+  direction: 'bullish' | 'bearish' | 'neutral';
+  /** Price change percentage over the window */
+  changePercent: number;
+  /** Current underlying price */
+  currentPrice: number;
+  /** Historical price from momentum window */
+  historicalPrice: number;
+  /** Reason for confirmation/rejection */
+  reason: string;
+}
+
+// ============= P2.1: Order Flow Analysis =============
+
+/**
+ * P2.1: Order flow metrics for predictive entry detection
+ * Tracks orderbook microstructure to predict price movements
+ */
+export interface OrderFlowMetrics {
+  /** Sum of bid sizes on top N levels */
+  bidPressure: number;
+  /** Sum of ask sizes on top N levels */
+  askPressure: number;
+  /** Imbalance ratio: (bid - ask) / (bid + ask), -1 to 1 */
+  imbalanceRatio: number;
+  /** Whether spread widened in the last window */
+  spreadWidening: boolean;
+  /** Whether a large bid was cancelled in the last 200ms */
+  largeCancellation: boolean;
+  /** Current spread (ask - bid) */
+  currentSpread: number;
+  /** Historical spread for comparison */
+  previousSpread: number;
+  /** Timestamp of metrics */
+  timestamp: number;
+}
+
+/**
+ * P2.1: Order flow signal for predictive entry
+ * Generated when orderbook microstructure suggests impending price move
+ */
+export interface OrderFlowSignal {
+  /** Side that is likely to experience price drop */
+  predictedDropSide: DipArbSide;
+  /** Confidence level (0-1, lower than standard signals) */
+  confidence: number;
+  /** Order flow metrics that triggered the signal */
+  metrics: OrderFlowMetrics;
+  /** Reason for signal generation */
+  reason: string;
+  /** Timestamp of signal */
+  timestamp: number;
+}
+
+/**
+ * P2.1: Orderbook delta tracking for cancellation detection
+ */
+export interface OrderbookDelta {
+  /** Token side (UP or DOWN) */
+  side: DipArbSide;
+  /** Bid level changes */
+  bidChanges: Array<{ price: number; sizeDelta: number }>;
+  /** Ask level changes */
+  askChanges: Array<{ price: number; sizeDelta: number }>;
+  /** Total value of cancelled bids */
+  cancelledBidValue: number;
+  /** Timestamp */
+  timestamp: number;
+}
+
+// ============= Signal Confidence (P0.3) =============
+
+/**
+ * P0.3: Signal confidence scoring for position sizing
+ * Higher confidence = larger position size
+ */
+export interface SignalConfidence {
+  /** Overall confidence score (0.0 - 1.0) */
+  score: number;
+  /** Individual factor scores */
+  factors: {
+    /** Drop magnitude factor (0-1): larger dips = higher confidence */
+    dropMagnitude: number;
+    /** Opposite side liquidity factor (0-1): better depth = higher confidence */
+    oppositeLiquidity: number;
+    /** Spread quality factor (0-1): tighter spread = higher confidence */
+    spreadQuality: number;
+    /** Time remaining factor (0-1): more time = higher confidence */
+    timeRemaining: number;
+  };
+}
+
+/**
+ * P0.3: Confidence-weighted position sizing config
+ */
+export interface ConfidencePositionConfig {
+  /** Enable confidence-weighted sizing */
+  enabled: boolean;
+  /** Minimum shares (at 0 confidence) - default 20 */
+  minShares: number;
+  /** Maximum shares (at 1.0 confidence) - default 80 */
+  maxShares: number;
+  /** Minimum confidence required to trade - default 0.2 */
+  minConfidence: number;
+}
+
 // ============= Signals =============
 
 /**
@@ -569,6 +875,8 @@ export interface DipArbLeg1Signal {
     btcChangePercent: number;
     estimatedWinRate: number;
   };
+  /** P0.3: Signal confidence for position sizing */
+  confidence?: SignalConfidence;
 }
 
 /**

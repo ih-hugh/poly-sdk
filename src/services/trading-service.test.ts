@@ -4,19 +4,37 @@
  * Tests validation logic in TradingService without requiring network access.
  */
 
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, vi, afterEach } from 'vitest';
 import { TradingService, MIN_ORDER_VALUE_USDC, MIN_ORDER_SIZE_SHARES } from './trading-service.js';
 import { RateLimiter } from '../core/rate-limiter.js';
 import { createUnifiedCache } from '../core/unified-cache.js';
 
 describe('TradingService Validation', () => {
   let service: TradingService;
+  let getTickSizeSpy: ReturnType<typeof vi.spyOn>;
+  let isNegRiskSpy: ReturnType<typeof vi.spyOn>;
 
   beforeAll(async () => {
     // Create service with a dummy private key - won't actually trade
     service = new TradingService(new RateLimiter(), createUnifiedCache(), {
       privateKey: '0x' + '1'.repeat(64), // Dummy key
     });
+  });
+
+  beforeEach(() => {
+    // Mock network-dependent methods to avoid timeouts
+    // These tests focus on validation logic, not network behavior
+    getTickSizeSpy = vi.spyOn(service, 'getTickSize').mockResolvedValue(0.01);
+    isNegRiskSpy = vi.spyOn(service, 'isNegRisk').mockResolvedValue(false);
+
+    // Mock ensureInitialized to return a mock client that throws on actual operations
+    // This ensures tests fail fast instead of timing out
+    vi.spyOn(service as unknown as { ensureInitialized(): Promise<unknown> }, 'ensureInitialized')
+      .mockRejectedValue(new Error('Test: Network not available'));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   describe('createMarketOrder validation', () => {
@@ -77,61 +95,75 @@ describe('TradingService Validation', () => {
 
     it('should accept orders at exactly 5 shares', async () => {
       // $2.50 at $0.50 = 5 shares (exactly at minimum)
-      // Note: This will still fail due to service not being initialized,
-      // but it should NOT fail the share validation
-      const result = await service.createMarketOrder({
-        tokenId: 'test-token',
-        side: 'BUY',
-        amount: 2.50,
-        price: 0.50,
-      });
-
-      // Should not contain the share validation error
-      if (!result.success) {
-        expect(result.errorMsg).not.toContain('shares, below Polymarket minimum');
+      // The validation should pass (not return share validation error)
+      // The order may fail for other reasons (network) but not share validation
+      try {
+        const result = await service.createMarketOrder({
+          tokenId: 'test-token',
+          side: 'BUY',
+          amount: 2.50,
+          price: 0.50,
+        });
+        // If we get a result, verify no share validation error
+        if (!result.success && result.errorMsg) {
+          expect(result.errorMsg).not.toContain('shares, below Polymarket minimum');
+        }
+      } catch (error) {
+        // If it throws, verify the error is not a share validation error
+        const errMsg = error instanceof Error ? error.message : String(error);
+        expect(errMsg).not.toContain('shares, below Polymarket minimum');
       }
     });
 
     it('should accept orders above 5 shares', async () => {
       // $5 at $0.50 = 10 shares (well above minimum)
-      const result = await service.createMarketOrder({
-        tokenId: 'test-token',
-        side: 'BUY',
-        amount: 5.0,
-        price: 0.50,
-      });
-
-      // Should not contain the share validation error
-      if (!result.success) {
-        expect(result.errorMsg).not.toContain('shares, below Polymarket minimum');
+      try {
+        const result = await service.createMarketOrder({
+          tokenId: 'test-token',
+          side: 'BUY',
+          amount: 5.0,
+          price: 0.50,
+        });
+        if (!result.success && result.errorMsg) {
+          expect(result.errorMsg).not.toContain('shares, below Polymarket minimum');
+        }
+      } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        expect(errMsg).not.toContain('shares, below Polymarket minimum');
       }
     });
 
     it('should skip share validation when price is not provided', async () => {
       // Market orders without explicit price can't be pre-validated for shares
-      const result = await service.createMarketOrder({
-        tokenId: 'test-token',
-        side: 'BUY',
-        amount: 1.0, // Valid amount, no price
-      });
-
-      // Should not contain the share validation error (may fail for other reasons)
-      if (!result.success) {
-        expect(result.errorMsg).not.toContain('shares, below Polymarket minimum');
+      try {
+        const result = await service.createMarketOrder({
+          tokenId: 'test-token',
+          side: 'BUY',
+          amount: 1.0, // Valid amount, no price
+        });
+        if (!result.success && result.errorMsg) {
+          expect(result.errorMsg).not.toContain('shares, below Polymarket minimum');
+        }
+      } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        expect(errMsg).not.toContain('shares, below Polymarket minimum');
       }
     });
 
     it('should skip share validation when price is zero', async () => {
-      const result = await service.createMarketOrder({
-        tokenId: 'test-token',
-        side: 'BUY',
-        amount: 1.0,
-        price: 0, // Zero price - can't calculate shares
-      });
-
-      // Should not contain the share validation error
-      if (!result.success) {
-        expect(result.errorMsg).not.toContain('shares, below Polymarket minimum');
+      try {
+        const result = await service.createMarketOrder({
+          tokenId: 'test-token',
+          side: 'BUY',
+          amount: 1.0,
+          price: 0, // Zero price - can't calculate shares
+        });
+        if (!result.success && result.errorMsg) {
+          expect(result.errorMsg).not.toContain('shares, below Polymarket minimum');
+        }
+      } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        expect(errMsg).not.toContain('shares, below Polymarket minimum');
       }
     });
   });

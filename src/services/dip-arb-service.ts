@@ -74,6 +74,10 @@ import {
   type SettlementRuleEvaluations,
   type SettlementEntryContext,
   type SettlementMarketSnapshot,
+  // P2.1: Order flow analysis types
+  type OrderFlowMetrics,
+  type OrderFlowSignal,
+  type OrderbookDelta,
   DEFAULT_DIP_ARB_CONFIG,
   DEFAULT_AUTO_ROTATE_CONFIG,
   DIP_ARB_CRYPTO_TAKER_FEE,
@@ -90,6 +94,7 @@ import {
   parseDurationFromSlug,
   isDipArbLeg1Signal,
 } from './dip-arb-types.js';
+import { MarketScorer, type TradeResult, type MarketScore } from './market-scorer.js';
 
 // ===== DipArbService =====
 
@@ -177,6 +182,9 @@ export class DipArbService extends EventEmitter {
   private config: DipArbConfigInternal;
   private autoRotateConfig: Required<DipArbAutoRotateConfig>;
 
+  // P1.2: Market performance scoring
+  private marketScorer: MarketScorer;
+
   // State
   private market: DipArbMarketConfig | null = null;
   private currentRound: DipArbRoundState | null = null;
@@ -220,11 +228,31 @@ export class DipArbService extends EventEmitter {
   // Price state
   private currentUnderlyingPrice = 0;
 
+  // P1.1: Chainlink price history for momentum validation
+  // Stores timestamped underlying prices for lookback comparison
+  private chainlinkPriceHistory: Array<{ timestamp: number; price: number }> = [];
+  private readonly MAX_CHAINLINK_HISTORY_LENGTH = 60;  // Keep 60 seconds at 1 update/sec
+
   // Signal state - prevent duplicate signals within same round
   private leg1SignalEmitted = false;
 
+  // P1.3: Two-tier entry state
+  private tier1EntryComplete = false;  // Whether Tier 1 entry has been executed
+  private tier1Shares = 0;             // Shares entered at Tier 1 (for Tier 2 calculation)
+
   // Settlement decision state - prevent duplicate settlement decisions within same round
   private settlementDecisionEmittedForRound: string | null = null;
+
+  // P2.1: Order flow analysis state
+  private previousUpAsks: Array<{ price: number; size: number }> = [];
+  private previousDownAsks: Array<{ price: number; size: number }> = [];
+  private previousUpBids: Array<{ price: number; size: number }> = [];
+  private previousDownBids: Array<{ price: number; size: number }> = [];
+  private spreadHistory: Array<{ timestamp: number; upSpread: number; downSpread: number }> = [];
+  private readonly MAX_SPREAD_HISTORY = 20;  // Keep ~2 seconds at 10 updates/sec
+  private recentCancellations: Array<{ timestamp: number; side: DipArbSide; value: number }> = [];
+  private readonly MAX_CANCELLATION_HISTORY = 50;
+  private orderFlowSignalEmitted = false;  // Prevent duplicate predictive signals
 
   // Smart logging state - reduce orderbook noise
   private lastOrderbookLogTime = 0;
@@ -242,6 +270,13 @@ export class DipArbService extends EventEmitter {
   // Skip detection until price history has enough data for sliding window comparison
   private isWarmedUp = false;
   private warmupStartTime = 0;
+
+  // Log deduplication for signal rejections
+  // Batches repeated rejection logs into periodic summaries
+  private rejectionCounts: Map<string, number> = new Map();
+  private lastRejectionLogTime = 0;
+  private lastRejectionType: string | null = null;
+  private readonly REJECTION_LOG_INTERVAL_MS = 30000; // 30s summary interval
 
   constructor(
     realtimeService: RealtimeServiceV2,
@@ -264,6 +299,9 @@ export class DipArbService extends EventEmitter {
     this.config = { ...DEFAULT_DIP_ARB_CONFIG };
     this.autoRotateConfig = { ...DEFAULT_AUTO_ROTATE_CONFIG };
     this.stats = createDipArbInitialStats();
+
+    // P1.2: Initialize market scorer for performance tracking
+    this.marketScorer = new MarketScorer();
 
     // Initialize CTF if private key provided
     if (privateKey) {
@@ -792,6 +830,7 @@ export class DipArbService extends EventEmitter {
     this.isRunning = true;
     this.stats = createDipArbInitialStats();
     this.priceHistory = [];  // Clear price history for new market
+    this.chainlinkPriceHistory = [];  // P1.1: Clear Chainlink history for new market
 
     // FIX #5: Initialize warm-up period - skip detection until slidingWindowMs has elapsed
     this.isWarmedUp = false;
@@ -1083,40 +1122,90 @@ export class DipArbService extends EventEmitter {
 
       // Check if Leg2 timeout has passed
       if (timeSinceLeg1 > this.getLeg2TimeoutSeconds()) {
-        this.log(`⚠️ Position timeout exceeded: ${timeSinceLeg1.toFixed(0)}s > ${this.getLeg2TimeoutSeconds()}s`);
+        // P2.3: Check if we should extend timeout for high-probability settlement
+        // This is a simplified check since market state isn't restored yet
+        if (this.config.enableSettlementHoldExtension) {
+          const timeToSettlementMin = (positionData.roundEndTime - now) / 60000;
+          const maxMinutesForExtension = this.config.settlementExtensionMaxMinutes ?? 5;
 
-        // For paper mode, calculate and emit the loss (no real exit needed)
-        if (this.config.paperMode) {
-          // FIXED: Use dynamic timeout loss based on elapsed time instead of hardcoded 7.5%
-          const timeoutSeconds = this.getLeg2TimeoutSeconds();
-          const estimatedLossRate = calculateTimeoutLossRate(timeSinceLeg1, timeoutSeconds);
-          const estimatedLoss = positionData.leg1Price * positionData.leg1Shares * estimatedLossRate;
+          if (timeToSettlementMin > 0 && timeToSettlementMin < maxMinutesForExtension) {
+            // Market is ending soon - restore state and let live monitoring handle settlement
+            this.log(`🎯 P2.3: Settlement approaching (${timeToSettlementMin.toFixed(1)}min), extending timeout for restoration`);
+            // Fall through to restore state - live monitoring will handle settlement decision
+          } else {
+            // Normal timeout handling
+            this.log(`⚠️ Position timeout exceeded: ${timeSinceLeg1.toFixed(0)}s > ${this.getLeg2TimeoutSeconds()}s`);
 
-          this.log(`📝 [PAPER] Recording timeout loss: ~$${estimatedLoss.toFixed(2)} (${(estimatedLossRate * 100).toFixed(1)}% of position)`);
+            // For paper mode, calculate and emit the loss (no real exit needed)
+            if (this.config.paperMode) {
+              // FIXED: Use dynamic timeout loss based on elapsed time instead of hardcoded 7.5%
+              const timeoutSeconds = this.getLeg2TimeoutSeconds();
+              const estimatedLossRate = calculateTimeoutLossRate(timeSinceLeg1, timeoutSeconds);
+              const estimatedLoss = positionData.leg1Price * positionData.leg1Shares * estimatedLossRate;
 
-          this.emit('paperTrade', {
-            type: 'exit',
-            side: positionData.leg1Side,
-            shares: positionData.leg1Shares,
-            price: positionData.leg1Price * (1 - estimatedLossRate),
-            profit: -estimatedLoss,
-            expectedPrice: positionData.leg1Price,   // Entry price as expected
-            slippagePercent: estimatedLossRate,      // Dynamic timeout loss rate
-            marketName: positionData.marketName,
-            conditionId: positionData.marketConditionId,
-            timestamp: Date.now(),
-            roundId: positionData.roundId,           // For round grouping in execution log
-          });
+              this.log(`📝 [PAPER] Recording timeout loss: ~$${estimatedLoss.toFixed(2)} (${(estimatedLossRate * 100).toFixed(1)}% of position)`);
 
-          this.emit('openPositionClosed', {
-            roundId: positionData.roundId,
-            status: 'timed_out',
-            closeType: 'timeout_recovery',
-            loss: estimatedLoss,
-          });
+              this.emit('paperTrade', {
+                type: 'exit',
+                side: positionData.leg1Side,
+                shares: positionData.leg1Shares,
+                price: positionData.leg1Price * (1 - estimatedLossRate),
+                profit: -estimatedLoss,
+                expectedPrice: positionData.leg1Price,   // Entry price as expected
+                slippagePercent: estimatedLossRate,      // Dynamic timeout loss rate
+                marketName: positionData.marketName,
+                conditionId: positionData.marketConditionId,
+                timestamp: Date.now(),
+                roundId: positionData.roundId,           // For round grouping in execution log
+              });
+
+              this.emit('openPositionClosed', {
+                roundId: positionData.roundId,
+                status: 'timed_out',
+                closeType: 'timeout_recovery',
+                loss: estimatedLoss,
+              });
+            }
+
+            return 'timed_out';
+          }
+        } else {
+          // P2.3 disabled - normal timeout handling
+          this.log(`⚠️ Position timeout exceeded: ${timeSinceLeg1.toFixed(0)}s > ${this.getLeg2TimeoutSeconds()}s`);
+
+          // For paper mode, calculate and emit the loss (no real exit needed)
+          if (this.config.paperMode) {
+            // FIXED: Use dynamic timeout loss based on elapsed time instead of hardcoded 7.5%
+            const timeoutSeconds = this.getLeg2TimeoutSeconds();
+            const estimatedLossRate = calculateTimeoutLossRate(timeSinceLeg1, timeoutSeconds);
+            const estimatedLoss = positionData.leg1Price * positionData.leg1Shares * estimatedLossRate;
+
+            this.log(`📝 [PAPER] Recording timeout loss: ~$${estimatedLoss.toFixed(2)} (${(estimatedLossRate * 100).toFixed(1)}% of position)`);
+
+            this.emit('paperTrade', {
+              type: 'exit',
+              side: positionData.leg1Side,
+              shares: positionData.leg1Shares,
+              price: positionData.leg1Price * (1 - estimatedLossRate),
+              profit: -estimatedLoss,
+              expectedPrice: positionData.leg1Price,   // Entry price as expected
+              slippagePercent: estimatedLossRate,      // Dynamic timeout loss rate
+              marketName: positionData.marketName,
+              conditionId: positionData.marketConditionId,
+              timestamp: Date.now(),
+              roundId: positionData.roundId,           // For round grouping in execution log
+            });
+
+            this.emit('openPositionClosed', {
+              roundId: positionData.roundId,
+              status: 'timed_out',
+              closeType: 'timeout_recovery',
+              loss: estimatedLoss,
+            });
+          }
+
+          return 'timed_out';
         }
-
-        return 'timed_out';
       }
 
       // Position is valid - restore state
@@ -1220,6 +1309,13 @@ export class DipArbService extends EventEmitter {
     this.currentRound = null;
     this.leg1SignalEmitted = false;
     this.settlementDecisionEmittedForRound = null;
+    // P1.3: Reset tiered entry state
+    this.tier1EntryComplete = false;
+    this.tier1Shares = 0;
+    // P2.1: Reset order flow state
+    this.orderFlowSignalEmitted = false;
+    this.recentCancellations = [];
+    this.spreadHistory = [];
 
     // Clean up pending settlement checks (processes outcomes before clearing)
     await this.cleanupPendingSettlements();
@@ -1356,6 +1452,33 @@ export class DipArbService extends EventEmitter {
     this.isSearchingMarket = false;
     this.searchStartTime = null;
     this.emit('searchComplete', { success: false, forced: true });
+  }
+
+  // ===== Public API: Market Scoring (P1.2) =====
+
+  /**
+   * P1.2: Get all market performance scores
+   * Returns scores sorted by composite score (highest first)
+   */
+  getMarketScores(): MarketScore[] {
+    return this.marketScorer.exportScores();
+  }
+
+  /**
+   * P1.2: Get score for a specific market
+   */
+  getMarketScore(underlying: DipArbUnderlying, duration: DipArbDurationString): MarketScore | null {
+    return this.marketScorer.getScore(underlying, duration);
+  }
+
+  /**
+   * P1.2: Get the best market from available options based on historical performance
+   * Falls back to round-robin if insufficient data
+   */
+  getBestMarket(
+    available: Array<{ underlying: DipArbUnderlying; duration: DipArbDurationString }>
+  ): { underlying: DipArbUnderlying; duration: DipArbDurationString } | null {
+    return this.marketScorer.getBestMarket(available);
   }
 
   // ===== Public API: Manual Execution =====
@@ -1843,6 +1966,18 @@ export class DipArbService extends EventEmitter {
     try {
       this.isExecuting = true;  // Also set here for manual mode (when not called from handleSignal)
 
+      // P2.2: Try maker order first if enabled and enough time remains
+      if (this.config.enableMakerOrders) {
+        const makerResult = await this.attemptMakerOrderLeg2(signal, startTime);
+        if (makerResult) {
+          return makerResult; // Maker order succeeded
+        }
+        // Maker order failed or timed out, fall through to market order
+        if (this.config.debug) {
+          this.log('📊 P2.2: Maker order failed, falling back to market order');
+        }
+      }
+
       // 计算拆分订单参数
       const splitCount = Math.max(1, this.config.splitOrders);
 
@@ -1957,6 +2092,9 @@ export class DipArbService extends EventEmitter {
 
         this.emit('roundComplete', roundResult);
 
+        // P1.2: Record trade for market scoring
+        this.recordTradeForScoring(roundResult);
+
         // Emit position closed event for backend persistence
         this.emit('openPositionClosed', {
           roundId: signal.roundId,
@@ -2011,6 +2149,183 @@ export class DipArbService extends EventEmitter {
       };
     } finally {
       this.isExecuting = false;
+    }
+  }
+
+  /**
+   * P2.2: Attempt maker order for Leg2 to reduce fees
+   * Returns execution result if successful, null if failed (fallback to market order)
+   */
+  private async attemptMakerOrderLeg2(
+    signal: DipArbLeg2Signal,
+    startTime: number
+  ): Promise<DipArbExecutionResult | null> {
+    if (!this.tradingService || !this.currentRound) return null;
+
+    const minTimeForMaker = this.config.minTimeForMakerOrder ?? 60;
+    const makerTimeout = this.config.makerOrderTimeout ?? 30;
+    const priceImprovement = this.config.makerPriceImprovement ?? 0.001;
+
+    // Check if enough time remains
+    const leg1Timestamp = this.currentRound.leg1?.timestamp ?? Date.now();
+    const timeSinceLeg1 = (Date.now() - leg1Timestamp) / 1000;
+    const timeUntilTimeout = this.getLeg2TimeoutSeconds() - timeSinceLeg1;
+
+    if (timeUntilTimeout < minTimeForMaker) {
+      if (this.config.debug) {
+        this.log(`📊 P2.2: Not enough time for maker (${timeUntilTimeout.toFixed(0)}s < ${minTimeForMaker}s)`);
+      }
+      return null; // Not enough time, use market order
+    }
+
+    // Calculate maker order price (inside spread)
+    const limitPrice = signal.currentPrice * (1 - priceImprovement);
+    const shares = signal.shares;
+
+    // Ensure minimum order size
+    const minSharesForMinAmount = Math.ceil(1 / limitPrice);
+    const adjustedShares = Math.max(shares, minSharesForMinAmount);
+
+    this.log(`📊 P2.2: Attempting maker order: ${adjustedShares} shares @ ${limitPrice.toFixed(4)} (${(priceImprovement * 100).toFixed(1)}% inside spread)`);
+
+    try {
+      // Place limit order
+      const orderResult = await this.tradingService.createLimitOrder({
+        tokenId: signal.tokenId,
+        side: 'BUY',
+        price: limitPrice,
+        size: adjustedShares,
+        orderType: 'GTC', // Good till cancelled
+      });
+
+      if (!orderResult.success || !orderResult.orderId) {
+        this.log(`📊 P2.2: Maker order placement failed: ${orderResult.errorMsg}`);
+        return null;
+      }
+
+      const orderId = orderResult.orderId;
+      this.log(`📊 P2.2: Maker order placed: ${orderId}`);
+
+      // Poll for fill
+      const pollIntervalMs = 2000;
+      const maxPolls = Math.floor((makerTimeout * 1000) / pollIntervalMs);
+      let filled = false;
+      let fillPrice = 0;
+      let filledShares = 0;
+
+      for (let i = 0; i < maxPolls; i++) {
+        await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+
+        // Check order status
+        const openOrders = await this.tradingService.getOpenOrders();
+        const order = openOrders.find(o => o.id === orderId);
+
+        if (!order) {
+          // Order no longer open - either filled or cancelled
+          // Check trades to confirm fill
+          const trades = await this.tradingService.getTrades();
+          const orderTrades = trades.filter(t => t.tokenId === signal.tokenId);
+
+          if (orderTrades.length > 0) {
+            const recentTrade = orderTrades[0];
+            filled = true;
+            fillPrice = recentTrade.price;
+            filledShares = recentTrade.size;
+            break;
+          } else {
+            // Order disappeared but no trade found - assume failed
+            this.log(`📊 P2.2: Maker order disappeared without fill`);
+            return null;
+          }
+        }
+
+        // Check partial fill
+        if (order.filledSize > 0) {
+          filled = true;
+          fillPrice = order.price;
+          filledShares = order.filledSize;
+
+          if (order.remainingSize < 1) {
+            // Effectively fully filled
+            break;
+          }
+        }
+
+        if (this.config.debug && i % 5 === 0) {
+          this.log(`📊 P2.2: Waiting for fill... (${(i * pollIntervalMs / 1000).toFixed(0)}s)`);
+        }
+      }
+
+      if (filled && filledShares > 0) {
+        this.log(`✅ P2.2: Maker order FILLED: ${filledShares} shares @ ${fillPrice.toFixed(4)} (0% fee)`);
+
+        // Complete the Leg2 with maker fill
+        const leg1Price = this.currentRound.leg1?.price ?? 0;
+        const actualTotalCost = leg1Price + fillPrice;
+
+        this.currentRound.leg2 = {
+          side: signal.hedgeSide,
+          price: fillPrice,
+          shares: filledShares,
+          timestamp: Date.now(),
+          tokenId: signal.tokenId,
+        };
+        this.currentRound.phase = 'completed';
+        this.currentRound.totalCost = actualTotalCost;
+
+        // Maker = 0% fee for Leg2, only 3% for Leg1
+        const feeRate = this.config.takerFeeRate ?? DIP_ARB_CRYPTO_TAKER_FEE;
+        const grossProfit = 1 - actualTotalCost;
+        const leg1Fee = leg1Price * feeRate;
+        const leg2Fee = 0; // Maker order = 0% fee
+        const totalFees = leg1Fee + leg2Fee;
+        const netProfitPerShare = grossProfit - totalFees / filledShares;
+        const netProfit = netProfitPerShare * filledShares;
+
+        this.currentRound.profit = netProfitPerShare;
+
+        this.stats.leg2Filled++;
+        this.stats.roundsSuccessful++;
+        this.stats.totalProfit += netProfit;
+        this.stats.totalSpent += actualTotalCost * filledShares;
+        this.openPositionCount = Math.max(0, this.openPositionCount - 1);
+
+        this.log(`   💰 Profit: $${netProfit.toFixed(2)} NET (maker fee: $0)`);
+
+        const roundResult: DipArbRoundResult = {
+          roundId: signal.roundId,
+          status: 'completed',
+          leg1: this.currentRound.leg1,
+          leg2: this.currentRound.leg2,
+          totalCost: actualTotalCost,
+          profit: netProfit,
+          profitRate: netProfitPerShare,
+          merged: false,
+        };
+
+        this.emit('roundComplete', roundResult);
+        this.recordTradeForScoring(roundResult);
+
+        return {
+          success: true,
+          leg: 'leg2',
+          roundId: signal.roundId,
+          side: signal.hedgeSide,
+          price: fillPrice,
+          shares: filledShares,
+          orderId,
+          executionTimeMs: Date.now() - startTime,
+        };
+      }
+
+      // Not filled within timeout - cancel and return null to use market order
+      this.log(`📊 P2.2: Maker order not filled in ${makerTimeout}s, cancelling...`);
+      await this.tradingService.cancelOrder(orderId);
+      return null;
+
+    } catch (error) {
+      this.log(`📊 P2.2: Maker order error: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
     }
   }
 
@@ -2118,6 +2433,9 @@ export class DipArbService extends EventEmitter {
       };
 
       this.emit('roundComplete', roundResult);
+
+      // P1.2: Record trade for market scoring
+      this.recordTradeForScoring(roundResult);
 
       // ✅ FIX: Emit position closed event for backend persistence
       this.emit('openPositionClosed', {
@@ -2297,12 +2615,20 @@ export class DipArbService extends EventEmitter {
     if (isUpToken) {
       this.upAsks = book.asks.map(l => ({ price: l.price, size: l.size }));
       this.upBids = book.bids.map(l => ({ price: l.price, size: l.size }));
+      // P2.1: Track orderbook delta AFTER updating (compares new vs previous)
+      if (this.config.enableOrderFlowPrediction) {
+        this.trackOrderbookDelta('UP');
+      }
       if (this.config.debug && this.upAsks.length === 0) {
         this.log('⚠️ UP orderbook is empty!');
       }
     } else if (isDownToken) {
       this.downAsks = book.asks.map(l => ({ price: l.price, size: l.size }));
       this.downBids = book.bids.map(l => ({ price: l.price, size: l.size }));
+      // P2.1: Track orderbook delta AFTER updating (compares new vs previous)
+      if (this.config.enableOrderFlowPrediction) {
+        this.trackOrderbookDelta('DOWN');
+      }
       if (this.config.debug && this.downAsks.length === 0) {
         this.log('⚠️ DOWN orderbook is empty!');
       }
@@ -2402,6 +2728,155 @@ export class DipArbService extends EventEmitter {
   }
 
   /**
+   * P1.1: Record Chainlink underlying price for momentum validation
+   * Maintains a rolling buffer of timestamped prices for lookback comparison
+   */
+  private recordChainlinkPriceHistory(price: number): void {
+    if (price <= 0) return;
+
+    this.chainlinkPriceHistory.push({
+      timestamp: Date.now(),
+      price,
+    });
+
+    // Trim history to max length (60 seconds of data)
+    if (this.chainlinkPriceHistory.length > this.MAX_CHAINLINK_HISTORY_LENGTH) {
+      this.chainlinkPriceHistory = this.chainlinkPriceHistory.slice(-this.MAX_CHAINLINK_HISTORY_LENGTH);
+    }
+  }
+
+  /**
+   * P1.1: Get Chainlink price from N seconds ago
+   * Returns null if insufficient history
+   */
+  private getChainlinkPriceFromSecondsAgo(seconds: number): number | null {
+    const targetTime = Date.now() - (seconds * 1000);
+
+    // Find the closest price at or before the target time
+    for (let i = this.chainlinkPriceHistory.length - 1; i >= 0; i--) {
+      const entry = this.chainlinkPriceHistory[i];
+      if (entry.timestamp <= targetTime) {
+        return entry.price;
+      }
+    }
+
+    // If no entry found at target time, check if we have old enough data
+    if (this.chainlinkPriceHistory.length > 0) {
+      const oldestEntry = this.chainlinkPriceHistory[0];
+      // If oldest entry is close to target (within 5s), use it
+      if (Math.abs(oldestEntry.timestamp - targetTime) < 5000) {
+        return oldestEntry.price;
+      }
+    }
+
+    return null; // Insufficient history
+  }
+
+  /**
+   * P1.1: Check Chainlink momentum to validate dip direction
+   *
+   * For a DIP signal (price dropped), we want to see:
+   * - UP dip: Underlying should be recovering (bullish) - price was falling, now rising
+   * - DOWN dip: Underlying should be falling (bearish) - confirms down pressure
+   *
+   * For a SURGE signal (opposite of dip), we want to see:
+   * - Buy DOWN after UP surge: Underlying should be falling (bearish)
+   * - Buy UP after DOWN surge: Underlying should be rising (bullish)
+   *
+   * @param dipSide - The side that dipped (UP or DOWN)
+   * @param source - Signal source ('dip', 'surge', 'mispricing')
+   * @returns MomentumResult with confirmation status
+   */
+  private checkChainlinkMomentum(
+    dipSide: DipArbSide,
+    source: 'dip' | 'surge' | 'mispricing'
+  ): import('./dip-arb-types.js').ChainlinkMomentumResult {
+    const windowSec = this.config.chainlinkMomentumWindowSec ?? 30;
+    const threshold = this.config.chainlinkMomentumThreshold ?? 0.001;
+
+    const currentPrice = this.currentUnderlyingPrice;
+    const historicalPrice = this.getChainlinkPriceFromSecondsAgo(windowSec);
+
+    // Default result for insufficient data
+    if (!historicalPrice || historicalPrice <= 0 || currentPrice <= 0) {
+      return {
+        confirmed: true, // Permissive when no data available
+        direction: 'neutral',
+        changePercent: 0,
+        currentPrice,
+        historicalPrice: historicalPrice ?? 0,
+        reason: 'insufficient_history',
+      };
+    }
+
+    const changePercent = (currentPrice - historicalPrice) / historicalPrice;
+
+    // Determine direction
+    let direction: 'bullish' | 'bearish' | 'neutral';
+    if (changePercent > threshold) {
+      direction = 'bullish';
+    } else if (changePercent < -threshold) {
+      direction = 'bearish';
+    } else {
+      direction = 'neutral';
+    }
+
+    // Determine if momentum confirms the signal
+    // Logic depends on signal type and side
+    let confirmed: boolean;
+    let reason: string;
+
+    if (source === 'dip') {
+      // For DIP signals: buying the dipped side, expecting recovery
+      if (dipSide === 'UP') {
+        // UP dipped - we're buying UP expecting it to recover
+        // Underlying should be rising (bullish) to confirm UP will win
+        confirmed = direction === 'bullish' || direction === 'neutral';
+        reason = confirmed
+          ? `UP dip confirmed: underlying ${direction} (${(changePercent * 100).toFixed(2)}%)`
+          : `UP dip rejected: underlying bearish (${(changePercent * 100).toFixed(2)}%) contradicts UP recovery`;
+      } else {
+        // DOWN dipped - we're buying DOWN expecting it to recover
+        // Underlying should be falling (bearish) to confirm DOWN will win
+        confirmed = direction === 'bearish' || direction === 'neutral';
+        reason = confirmed
+          ? `DOWN dip confirmed: underlying ${direction} (${(changePercent * 100).toFixed(2)}%)`
+          : `DOWN dip rejected: underlying bullish (${(changePercent * 100).toFixed(2)}%) contradicts DOWN recovery`;
+      }
+    } else if (source === 'surge') {
+      // For SURGE signals: opposite side surged, we buy the other side
+      if (dipSide === 'DOWN') {
+        // UP surged, we're buying DOWN
+        // Underlying should be falling (bearish) to support DOWN
+        confirmed = direction === 'bearish' || direction === 'neutral';
+        reason = confirmed
+          ? `DOWN buy (after UP surge) confirmed: underlying ${direction}`
+          : `DOWN buy rejected: underlying bullish contradicts DOWN`;
+      } else {
+        // DOWN surged, we're buying UP
+        // Underlying should be rising (bullish) to support UP
+        confirmed = direction === 'bullish' || direction === 'neutral';
+        reason = confirmed
+          ? `UP buy (after DOWN surge) confirmed: underlying ${direction}`
+          : `UP buy rejected: underlying bearish contradicts UP`;
+      }
+    } else {
+      // Mispricing - neutral check, just log momentum
+      confirmed = true;
+      reason = `Mispricing signal: underlying ${direction} (${(changePercent * 100).toFixed(2)}%)`;
+    }
+
+    return {
+      confirmed,
+      direction,
+      changePercent,
+      currentPrice,
+      historicalPrice,
+      reason,
+    };
+  }
+
+  /**
    * Get price from N milliseconds ago for sliding window detection
    *
    * @param side - 'UP' or 'DOWN'
@@ -2436,6 +2911,9 @@ export class DipArbService extends EventEmitter {
     // currentUnderlyingPrice = LIVE Chainlink price (for tracking/display)
     // This is NOT the same as priceToBeat (which is fixed at window start)
     this.currentUnderlyingPrice = price.price;
+
+    // P1.1: Record Chainlink price history for momentum validation
+    this.recordChainlinkPriceHistory(price.price);
 
     // Fallback: If priceToBeat couldn't be fetched from API, use first Chainlink price
     if (this.currentRound && this.currentRound.priceToBeat === 0 && price.price > 0) {
@@ -2550,6 +3028,16 @@ export class DipArbService extends EventEmitter {
       // Reset signal state for new round
       this.leg1SignalEmitted = false;
       this.settlementDecisionEmittedForRound = null;
+      // P1.3: Reset tiered entry state for new round
+      this.tier1EntryComplete = false;
+      this.tier1Shares = 0;
+      // P2.1: Reset order flow state for new round
+      this.orderFlowSignalEmitted = false;
+      this.recentCancellations = [];
+      this.spreadHistory = [];
+      // Reset rejection log deduplication for new round
+      this.rejectionCounts.clear();
+      this.lastRejectionType = null;
 
       this.stats.roundsMonitored++;
 
@@ -2641,6 +3129,10 @@ export class DipArbService extends EventEmitter {
         };
 
         this.emit('roundComplete', result);
+
+        // P1.2: Record trade for market scoring (timeout/expired)
+        this.recordTradeForScoring(result);
+
         this.log(`Round expired: ${this.currentRound.roundId} | Exit: ${exitResult?.success ? 'SUCCESS' : 'FAILED'}`);
       }
     }
@@ -2908,6 +3400,20 @@ export class DipArbService extends EventEmitter {
 
     // Check based on current phase
     if (this.currentRound.phase === 'waiting') {
+      // P2.1: Try order flow prediction first (predictive entry)
+      if (this.config.enableOrderFlowPrediction && !this.orderFlowSignalEmitted) {
+        const orderFlowSignal = this.detectOrderFlowImbalance();
+        if (orderFlowSignal) {
+          const predictiveSignal = this.createPredictiveLeg1Signal(orderFlowSignal);
+          if (predictiveSignal && this.validateSignalProfitability(predictiveSignal)) {
+            if (this.config.debug) {
+              this.log(`🔮 P2.1: Predictive entry signal for ${orderFlowSignal.predictedDropSide}`);
+            }
+            return predictiveSignal;
+          }
+        }
+      }
+      // Standard detection
       return this.detectLeg1Signal();
     } else if (this.currentRound.phase === 'leg1_filled') {
       return this.detectLeg2Signal();
@@ -2915,6 +3421,327 @@ export class DipArbService extends EventEmitter {
 
     return null;
   }
+
+  /**
+   * P1.3: Detect tiered entry signals (Tier 1 at 1.5%, Tier 2 at 2.5%)
+   *
+   * Logic:
+   * - Tier 1: At tier1DipThreshold (1.5%) with momentum confirmation → 50% shares
+   * - Tier 2: At full dipThreshold (2.5%) → remaining 50% shares
+   * - If Tier 1 triggered but not Tier 2, proceed with partial position to Leg2
+   *
+   * Returns signal if either tier triggers, null otherwise
+   */
+  private detectTieredEntry(upPrice: number, downPrice: number): DipArbLeg1Signal | null {
+    if (!this.currentRound) return null;
+
+    const tier1Threshold = this.config.tier1DipThreshold ?? 0.015;
+    const tier2Threshold = this.config.dipThreshold; // Full threshold
+    const tier1ShareRatio = this.config.tier1ShareRatio ?? 0.5;
+    const requireMomentumForTier1 = this.config.requireMomentumForTier1 ?? true;
+
+    const upPriceAgo = this.getPriceFromHistory('UP', this.config.slidingWindowMs);
+    const downPriceAgo = this.getPriceFromHistory('DOWN', this.config.slidingWindowMs);
+
+    // Check for UP dip
+    if (upPriceAgo !== null && upPriceAgo > 0) {
+      const upInstantDrop = (upPriceAgo - upPrice) / upPriceAgo;
+
+      // Tier 2: Full threshold reached - enter remaining position (or full if Tier 1 not executed)
+      if (upInstantDrop >= tier2Threshold) {
+        if (this.tier1EntryComplete) {
+          // Tier 2 entry - add remaining shares
+          const tier2Shares = Math.floor(this.config.shares * (1 - tier1ShareRatio));
+          if (tier2Shares > 0) {
+            if (this.config.debug) {
+              this.log(`⚡ P1.3 Tier 2 DIP: UP -${(upInstantDrop * 100).toFixed(1)}% → adding ${tier2Shares} shares`);
+            }
+            const signal = this.createLeg1Signal('UP', upPrice, downPrice, 'dip', upInstantDrop, upPriceAgo, tier2Shares);
+            if (signal && this.validateSignalProfitability(signal)) {
+              return signal;
+            }
+          }
+        }
+        // If no Tier 1, fall through to standard detection
+        return null;
+      }
+
+      // Tier 1: Early entry at lower threshold with momentum
+      if (!this.tier1EntryComplete && upInstantDrop >= tier1Threshold) {
+        // Check momentum if required
+        if (requireMomentumForTier1) {
+          const momentum = this.checkChainlinkMomentum('UP', 'dip');
+          if (!momentum.confirmed) {
+            if (this.config.debug && Date.now() % 5000 < 100) {
+              this.log(`⚠️ P1.3 Tier 1 skipped: momentum not confirmed - ${momentum.reason}`);
+            }
+            return null;
+          }
+        }
+
+        const tier1Shares = Math.floor(this.config.shares * tier1ShareRatio);
+        if (this.config.debug) {
+          this.log(`⚡ P1.3 Tier 1 DIP: UP -${(upInstantDrop * 100).toFixed(1)}% → entering ${tier1Shares} shares (early entry)`);
+        }
+        const signal = this.createLeg1Signal('UP', upPrice, downPrice, 'dip', upInstantDrop, upPriceAgo, tier1Shares);
+        if (signal && this.validateSignalProfitability(signal)) {
+          // Mark Tier 1 as complete for this round
+          this.tier1EntryComplete = true;
+          this.tier1Shares = tier1Shares;
+          return signal;
+        }
+      }
+    }
+
+    // Check for DOWN dip
+    if (downPriceAgo !== null && downPriceAgo > 0) {
+      const downInstantDrop = (downPriceAgo - downPrice) / downPriceAgo;
+
+      // Tier 2: Full threshold reached
+      if (downInstantDrop >= tier2Threshold) {
+        if (this.tier1EntryComplete) {
+          const tier2Shares = Math.floor(this.config.shares * (1 - tier1ShareRatio));
+          if (tier2Shares > 0) {
+            if (this.config.debug) {
+              this.log(`⚡ P1.3 Tier 2 DIP: DOWN -${(downInstantDrop * 100).toFixed(1)}% → adding ${tier2Shares} shares`);
+            }
+            const signal = this.createLeg1Signal('DOWN', downPrice, upPrice, 'dip', downInstantDrop, downPriceAgo, tier2Shares);
+            if (signal && this.validateSignalProfitability(signal)) {
+              return signal;
+            }
+          }
+        }
+        return null;
+      }
+
+      // Tier 1: Early entry
+      if (!this.tier1EntryComplete && downInstantDrop >= tier1Threshold) {
+        if (requireMomentumForTier1) {
+          const momentum = this.checkChainlinkMomentum('DOWN', 'dip');
+          if (!momentum.confirmed) {
+            if (this.config.debug && Date.now() % 5000 < 100) {
+              this.log(`⚠️ P1.3 Tier 1 skipped: momentum not confirmed - ${momentum.reason}`);
+            }
+            return null;
+          }
+        }
+
+        const tier1Shares = Math.floor(this.config.shares * tier1ShareRatio);
+        if (this.config.debug) {
+          this.log(`⚡ P1.3 Tier 1 DIP: DOWN -${(downInstantDrop * 100).toFixed(1)}% → entering ${tier1Shares} shares (early entry)`);
+        }
+        const signal = this.createLeg1Signal('DOWN', downPrice, upPrice, 'dip', downInstantDrop, downPriceAgo, tier1Shares);
+        if (signal && this.validateSignalProfitability(signal)) {
+          this.tier1EntryComplete = true;
+          this.tier1Shares = tier1Shares;
+          return signal;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  // ============= P2.1: Order Flow Analysis Methods =============
+
+  /**
+   * P2.1: Track orderbook deltas to detect large cancellations
+   * Called on each orderbook update to track changes
+   */
+  private trackOrderbookDelta(side: DipArbSide): void {
+    const now = Date.now();
+    const currentAsks = side === 'UP' ? this.upAsks : this.downAsks;
+    const currentBids = side === 'UP' ? this.upBids : this.downBids;
+    const previousAsks = side === 'UP' ? this.previousUpAsks : this.previousDownAsks;
+    const previousBids = side === 'UP' ? this.previousUpBids : this.previousDownBids;
+
+    // Calculate cancelled bid value (significant cancellations)
+    let cancelledBidValue = 0;
+    for (const prevBid of previousBids) {
+      const currentBid = currentBids.find(b => Math.abs(b.price - prevBid.price) < 0.001);
+      if (!currentBid) {
+        // Bid completely removed
+        cancelledBidValue += prevBid.price * prevBid.size;
+      } else if (currentBid.size < prevBid.size) {
+        // Bid size reduced
+        cancelledBidValue += prevBid.price * (prevBid.size - currentBid.size);
+      }
+    }
+
+    // Track large cancellations
+    const threshold = this.config.largeCancellationThreshold ?? 500;
+    if (cancelledBidValue >= threshold) {
+      this.recentCancellations.push({
+        timestamp: now,
+        side,
+        value: cancelledBidValue,
+      });
+
+      // Trim history
+      if (this.recentCancellations.length > this.MAX_CANCELLATION_HISTORY) {
+        this.recentCancellations = this.recentCancellations.slice(-this.MAX_CANCELLATION_HISTORY);
+      }
+
+      if (this.config.debug) {
+        this.log(`📊 P2.1 Large cancellation detected: ${side} bid -$${cancelledBidValue.toFixed(0)}`);
+      }
+    }
+
+    // Update previous state
+    if (side === 'UP') {
+      this.previousUpAsks = [...currentAsks];
+      this.previousUpBids = [...currentBids];
+    } else {
+      this.previousDownAsks = [...currentAsks];
+      this.previousDownBids = [...currentBids];
+    }
+
+    // Track spread history
+    const upSpread = (this.upAsks[0]?.price ?? 0) - (this.upBids[0]?.price ?? 0);
+    const downSpread = (this.downAsks[0]?.price ?? 0) - (this.downBids[0]?.price ?? 0);
+    this.spreadHistory.push({ timestamp: now, upSpread, downSpread });
+    if (this.spreadHistory.length > this.MAX_SPREAD_HISTORY) {
+      this.spreadHistory = this.spreadHistory.slice(-this.MAX_SPREAD_HISTORY);
+    }
+  }
+
+  /**
+   * P2.1: Calculate current order flow metrics
+   */
+  private calculateOrderFlowMetrics(side: DipArbSide): OrderFlowMetrics {
+    const now = Date.now();
+    const depthLevels = this.config.orderFlowDepthLevels ?? 3;
+    const spreadWindowMs = this.config.spreadWideningWindowMs ?? 500;
+
+    const asks = side === 'UP' ? this.upAsks : this.downAsks;
+    const bids = side === 'UP' ? this.upBids : this.downBids;
+
+    // Sum pressure on top N levels
+    const askPressure = asks.slice(0, depthLevels).reduce((sum, l) => sum + l.price * l.size, 0);
+    const bidPressure = bids.slice(0, depthLevels).reduce((sum, l) => sum + l.price * l.size, 0);
+
+    // Calculate imbalance ratio: -1 (all asks) to +1 (all bids)
+    const totalPressure = bidPressure + askPressure;
+    const imbalanceRatio = totalPressure > 0 ? (bidPressure - askPressure) / totalPressure : 0;
+
+    // Current and historical spread
+    const currentSpread = (asks[0]?.price ?? 0) - (bids[0]?.price ?? 0);
+    const previousSpread = this.spreadHistory.length > 0
+      ? (side === 'UP' ? this.spreadHistory[0].upSpread : this.spreadHistory[0].downSpread)
+      : currentSpread;
+
+    // Check for spread widening in the window
+    const spreadWidening = currentSpread > previousSpread * 1.1; // 10% wider
+
+    // Check for recent large cancellation
+    const cancellationCutoff = now - 200; // Last 200ms
+    const largeCancellation = this.recentCancellations.some(
+      c => c.timestamp > cancellationCutoff && c.side === side
+    );
+
+    return {
+      bidPressure,
+      askPressure,
+      imbalanceRatio,
+      spreadWidening,
+      largeCancellation,
+      currentSpread,
+      previousSpread,
+      timestamp: now,
+    };
+  }
+
+  /**
+   * P2.1: Detect order flow imbalance that predicts price drop
+   * Returns predictive signal if conditions met, null otherwise
+   */
+  private detectOrderFlowImbalance(): OrderFlowSignal | null {
+    if (!this.config.enableOrderFlowPrediction) return null;
+    if (!this.currentRound || !this.market) return null;
+    if (this.orderFlowSignalEmitted) return null; // Already emitted this round
+
+    const imbalanceThreshold = this.config.orderFlowImbalanceThreshold ?? -0.33;
+
+    // Check both sides for sell pressure
+    for (const side of ['UP', 'DOWN'] as DipArbSide[]) {
+      const metrics = this.calculateOrderFlowMetrics(side);
+
+      // Prediction logic: High sell pressure (negative imbalance) + spread widening OR large cancellation
+      const hasImbalance = metrics.imbalanceRatio <= imbalanceThreshold;
+      const hasUrgencySignal = metrics.spreadWidening || metrics.largeCancellation;
+
+      if (hasImbalance && hasUrgencySignal) {
+        // Calculate confidence based on signal strength
+        const imbalanceStrength = Math.abs(metrics.imbalanceRatio);
+        const urgencyBonus = metrics.largeCancellation ? 0.2 : 0.1;
+        const confidence = Math.min(0.5, imbalanceStrength + urgencyBonus); // Cap at 0.5 for predictive
+
+        const signal: OrderFlowSignal = {
+          predictedDropSide: side,
+          confidence,
+          metrics,
+          reason: metrics.largeCancellation
+            ? `Large bid cancellation + ${(imbalanceStrength * 100).toFixed(0)}% sell pressure`
+            : `Spread widening + ${(imbalanceStrength * 100).toFixed(0)}% sell pressure`,
+          timestamp: Date.now(),
+        };
+
+        this.orderFlowSignalEmitted = true;
+
+        if (this.config.debug) {
+          this.log(`🔮 P2.1 Predictive signal: ${side} drop predicted (${signal.reason})`);
+        }
+
+        return signal;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * P2.1: Create Leg1 signal from order flow prediction
+   * Uses reduced position size due to lower confidence
+   */
+  private createPredictiveLeg1Signal(orderFlowSignal: OrderFlowSignal): DipArbLeg1Signal | null {
+    if (!this.currentRound || !this.market) return null;
+
+    const side = orderFlowSignal.predictedDropSide;
+    const price = side === 'UP' ? (this.upAsks[0]?.price ?? 1) : (this.downAsks[0]?.price ?? 1);
+    const oppositePrice = side === 'UP' ? (this.downAsks[0]?.price ?? 1) : (this.upAsks[0]?.price ?? 1);
+
+    // Use reduced shares for predictive signals
+    const predictiveShareRatio = this.config.predictiveShareRatio ?? 0.3;
+    const predictiveShares = Math.floor(this.config.shares * predictiveShareRatio);
+
+    // Create signal with 'mispricing' source (closest match for predictive)
+    const signal = this.createLeg1Signal(
+      side,
+      price,
+      oppositePrice,
+      'mispricing',
+      0, // No drop yet - predictive
+      price, // Reference price is current
+      predictiveShares
+    );
+
+    if (signal) {
+      // Override confidence to reflect predictive nature
+      signal.confidence = {
+        score: orderFlowSignal.confidence,
+        factors: {
+          dropMagnitude: 0, // No drop yet
+          oppositeLiquidity: signal.confidence?.factors.oppositeLiquidity ?? 0.5,
+          spreadQuality: signal.confidence?.factors.spreadQuality ?? 0.5,
+          timeRemaining: signal.confidence?.factors.timeRemaining ?? 0.5,
+        },
+      };
+    }
+
+    return signal;
+  }
+
+  // ============= End P2.1 Methods =============
 
   private detectLeg1Signal(): DipArbLeg1Signal | null {
     if (!this.currentRound || !this.market) return null;
@@ -2932,6 +3759,21 @@ export class DipArbService extends EventEmitter {
     // Skip if no valid prices
     if (upPrice >= 1 || downPrice >= 1 || openPrices.up <= 0 || openPrices.down <= 0) {
       return null;
+    }
+
+    // ========================================
+    // P1.3: Two-Tier Entry System
+    // ========================================
+    // If enabled, check for Tier 1 (1.5%) and Tier 2 (2.5%) entries
+    // Tier 1: 50% position with momentum confirmation
+    // Tier 2: Remaining 50% at full threshold (adds to existing position)
+    if (this.config.enableTieredEntry) {
+      const tieredSignal = this.detectTieredEntry(upPrice, downPrice);
+      if (tieredSignal) {
+        return tieredSignal;
+      }
+      // If tiered entry didn't produce signal, fall through to standard detection
+      // This handles cases where tiered entry is disabled mid-round or for non-dip signals
     }
 
     // ========================================
@@ -3036,19 +3878,76 @@ export class DipArbService extends EventEmitter {
     return null;
   }
 
+  /**
+   * P0.3: Calculate signal confidence score for position sizing
+   * Returns 0.0 - 1.0 confidence based on multiple factors
+   */
+  private calculateSignalConfidence(
+    dropPercent: number,
+    oppositeAsk: number,
+    side: DipArbSide
+  ): { score: number; factors: { dropMagnitude: number; oppositeLiquidity: number; spreadQuality: number; timeRemaining: number } } {
+    // Factor 1: Drop magnitude (0-1)
+    // Larger dips = higher confidence (normalized: 2.5% = 0.5, 5% = 1.0)
+    const normalizedDrop = Math.min(dropPercent / 0.05, 1.0); // 5% = max confidence
+    const dropMagnitude = normalizedDrop;
+
+    // Factor 2: Opposite side liquidity (0-1)
+    // Check depth on opposite side orderbook
+    const oppositeAsks = side === 'UP' ? this.downAsks : this.upAsks;
+    const totalDepth = oppositeAsks.slice(0, 3).reduce((sum, level) => sum + (level?.size ?? 0), 0);
+    const minDepth = this.config.minOppositeSideDepth ?? 100;
+    const oppositeLiquidity = Math.min(totalDepth / (minDepth * 3), 1.0); // 300 shares = max confidence
+
+    // Factor 3: Spread quality (0-1)
+    // Tighter spread on opposite side = higher confidence
+    const oppositeBids = side === 'UP' ? this.downBids : this.upBids;
+    const bestBid = oppositeBids[0]?.price ?? 0;
+    const bestAsk = oppositeAsks[0]?.price ?? 1;
+    const spread = bestAsk > 0 && bestBid > 0 ? (bestAsk - bestBid) / bestAsk : 0.10;
+    const maxSpread = this.config.maxOppositeSideSpread ?? 0.05;
+    const spreadQuality = Math.max(0, 1 - (spread / maxSpread)); // 0% spread = 1.0, 5% spread = 0.0
+
+    // Factor 4: Time remaining (0-1)
+    // More time in market window = higher confidence for Leg2 opportunity
+    const timeRemaining = this.market && this.market.endTime
+      ? Math.max(0, (this.market.endTime.getTime() - Date.now()) / (this.config.windowMinutes * 60 * 1000))
+      : 0.5;
+    const timeRemainingScore = Math.min(timeRemaining, 1.0);
+
+    // Weighted average: drop magnitude most important
+    const score = (
+      dropMagnitude * 0.35 +
+      oppositeLiquidity * 0.25 +
+      spreadQuality * 0.25 +
+      timeRemainingScore * 0.15
+    );
+
+    return {
+      score: Math.max(0, Math.min(1, score)), // Clamp to 0-1
+      factors: {
+        dropMagnitude,
+        oppositeLiquidity,
+        spreadQuality,
+        timeRemaining: timeRemainingScore,
+      },
+    };
+  }
+
   private createLeg1Signal(
     side: DipArbSide,
     price: number,
     oppositeAsk: number,
     source: 'dip' | 'surge' | 'mispricing',
     dropPercent: number,
-    referencePrice?: number  // 用于 dip/surge: 滑动窗口前的价格
+    referencePrice?: number,  // 用于 dip/surge: 滑动窗口前的价格
+    overrideShares?: number   // P1.3: Override shares for tiered entry
   ): DipArbLeg1Signal | null {
     if (!this.currentRound || !this.market) return null;
 
     const targetPrice = price * (1 + this.config.maxSlippage);
     const estimatedTotalCost = targetPrice + oppositeAsk;
-    
+
     // Calculate fee-adjusted profit rate for accurate signal evaluation
     const grossProfitRate = calculateDipArbProfitRate(estimatedTotalCost);
     const feeRate = this.config.takerFeeRate ?? DIP_ARB_CRYPTO_TAKER_FEE;
@@ -3060,6 +3959,30 @@ export class DipArbService extends EventEmitter {
     const openPrice = referencePrice ??
       (side === 'UP' ? this.currentRound.openPrices.up : this.currentRound.openPrices.down);
 
+    // P0.3: Calculate confidence score for position sizing
+    const confidence = this.calculateSignalConfidence(dropPercent, oppositeAsk, side);
+
+    // P1.3: Use override shares if provided (tiered entry), otherwise use P0.3 confidence scaling
+    let finalShares: number;
+    if (overrideShares !== undefined) {
+      // P1.3: Tiered entry uses explicit share count
+      finalShares = overrideShares;
+    } else {
+      // P0.3: Scale shares based on confidence (20-80 range)
+      // Formula: shares = baseShares * (0.4 + confidence * 1.2)
+      // At confidence 0.0: 50 * 0.4 = 20 shares
+      // At confidence 0.5: 50 * 1.0 = 50 shares
+      // At confidence 1.0: 50 * 1.6 = 80 shares
+      const baseShares = this.config.shares;
+      const confidenceMultiplier = 0.4 + confidence.score * 1.2;
+      const scaledShares = Math.floor(baseShares * confidenceMultiplier);
+      finalShares = Math.max(20, Math.min(80, scaledShares));
+    }
+
+    if (this.config.debug) {
+      this.log(`📊 Confidence: ${(confidence.score * 100).toFixed(0)}% → ${finalShares} shares (drop=${(confidence.factors.dropMagnitude * 100).toFixed(0)}%, liq=${(confidence.factors.oppositeLiquidity * 100).toFixed(0)}%, spread=${(confidence.factors.spreadQuality * 100).toFixed(0)}%, time=${(confidence.factors.timeRemaining * 100).toFixed(0)}%)`);
+    }
+
     const signal: DipArbLeg1Signal = {
       type: 'leg1',
       roundId: this.currentRound.roundId,
@@ -3068,12 +3991,13 @@ export class DipArbService extends EventEmitter {
       openPrice,  // 参考价格（3秒前的价格或轮次开盘价）
       dropPercent,
       targetPrice,
-      shares: this.config.shares,
+      shares: finalShares, // P0.3: Use confidence-weighted shares
       tokenId: side === 'UP' ? this.market.upTokenId : this.market.downTokenId,
       oppositeAsk,
       estimatedTotalCost,
       estimatedProfitRate,
       source,
+      confidence, // P0.3: Include confidence for logging/analysis
     };
 
     // Add BTC info if available
@@ -3104,21 +4028,46 @@ export class DipArbService extends EventEmitter {
 
     // Check if profitable - 只用 sumTarget 控制
     // FIX #8: Near timeout, accept degraded Leg2 to mitigate Leg1 loss
+    // P0.1: Extended degradation window (90s) with quadratic urgency for better timeout recovery
     const leg2TimeoutSeconds = this.getLeg2TimeoutSeconds();
     const timeSinceLeg1 = (Date.now() - leg1.timestamp) / 1000;
     const timeUntilTimeout = leg2TimeoutSeconds - timeSinceLeg1;
-    const DEGRADED_WINDOW_SECONDS = 30; // Last 30 seconds before timeout
-    const DEGRADED_TOLERANCE = 0.02;    // Accept 2% worse than sumTarget
+    const DEGRADED_WINDOW_SECONDS = 90; // P0.1: Extended from 30s to 90s
+    const MAX_DEGRADED_TOLERANCE = 0.04; // P0.1: Increased from 2% to 4% max tolerance
+
+    // P2.3: Check if we should extend timeout for high-probability settlement
+    // If conditions are met, skip degradation and wait for settlement instead
+    const settlementExtension = this.shouldExtendTimeoutForSettlement();
+    if (settlementExtension.extend && timeUntilTimeout <= 0) {
+      // Timeout exceeded BUT we're near high-probability settlement
+      // Don't force degraded Leg2 - let position settle
+      if (this.config.debug && Date.now() % 5000 < 100) {
+        this.log(`🎯 P2.3: Timeout bypassed - holding for settlement`);
+        this.log(`   Win probability: ${(settlementExtension.winProbability * 100).toFixed(1)}%`);
+        this.log(`   Time to settlement: ${settlementExtension.timeToSettlementMin.toFixed(1)} min`);
+      }
+      return null; // Skip Leg2, wait for settlement
+    }
 
     // Calculate effective sumTarget (may be degraded near timeout)
     let effectiveSumTarget = this.config.sumTarget;
-    if (timeUntilTimeout < DEGRADED_WINDOW_SECONDS && timeUntilTimeout > 0) {
-      // Linear degradation: worse trades accepted as timeout approaches
+
+    // P2.3: If settlement extension is active, don't degrade the sumTarget
+    // We want to wait for either good Leg2 or settlement, not force a bad trade
+    const skipDegradation = settlementExtension.extend;
+
+    if (!skipDegradation && timeUntilTimeout < DEGRADED_WINDOW_SECONDS && timeUntilTimeout > 0) {
+      // P0.1: Quadratic degradation - slow at first, accelerating near timeout
+      // At 45s remaining: ~1% tolerance, at 10s remaining: ~3.5% tolerance
       const urgency = (DEGRADED_WINDOW_SECONDS - timeUntilTimeout) / DEGRADED_WINDOW_SECONDS;
-      effectiveSumTarget = this.config.sumTarget * (1 + DEGRADED_TOLERANCE * urgency);
+      const toleranceMultiplier = Math.pow(urgency, 1.5); // Quadratic curve
+      effectiveSumTarget = this.config.sumTarget * (1 + MAX_DEGRADED_TOLERANCE * toleranceMultiplier);
       if (this.config.debug && Date.now() % 5000 < 100) {
-        this.log(`⚠️ Degraded mode: ${timeUntilTimeout.toFixed(0)}s until timeout, accepting up to ${effectiveSumTarget.toFixed(4)}`);
+        const toleranceApplied = (MAX_DEGRADED_TOLERANCE * toleranceMultiplier * 100).toFixed(1);
+        this.log(`⚠️ Degraded mode: ${timeUntilTimeout.toFixed(0)}s until timeout, tolerance +${toleranceApplied}%, accepting up to ${effectiveSumTarget.toFixed(4)}`);
       }
+    } else if (skipDegradation && this.config.debug && Date.now() % 10000 < 100) {
+      this.log(`🎯 P2.3: Settlement extension active - skipping degradation (win prob: ${(settlementExtension.winProbability * 100).toFixed(1)}%)`);
     }
 
     if (totalCost > effectiveSumTarget) {
@@ -3195,8 +4144,8 @@ export class DipArbService extends EventEmitter {
     const downPrice = this.downAsks[0]?.price ?? 0.5;
 
     if (upPrice > maxAsymmetry || downPrice > maxAsymmetry) {
-      // Always log asymmetry rejections (critical for understanding why no trades)
-      console.log(`[DipArb] ❌ Signal rejected: market too asymmetric (UP=${(upPrice * 100).toFixed(0)}%, DOWN=${(downPrice * 100).toFixed(0)}%) - wait for rotation`);
+      // Log with deduplication (critical for understanding why no trades)
+      this.logRejection('asymmetric', `market too asymmetric (UP=${(upPrice * 100).toFixed(0)}%, DOWN=${(downPrice * 100).toFixed(0)}%) - wait for rotation`);
       return false;
     }
 
@@ -3292,8 +4241,8 @@ export class DipArbService extends EventEmitter {
       const maxDropThreshold = this.config.maxRequiredLeg2Drop ?? 0.15;
 
       if (requiredDropPercent > maxDropThreshold) {
-        // Always log spread rejections (critical for understanding why no trades)
-        console.log(`[DipArb] ❌ Signal rejected: ${signal.dipSide} dip, but leg2 needs ${(requiredDropPercent * 100).toFixed(1)}% drop (max ${(maxDropThreshold * 100).toFixed(0)}%) - spread too wide`);
+        // Log with deduplication (critical for understanding why no trades)
+        this.logRejection('leg2_spread', `${signal.dipSide} dip, but leg2 needs ${(requiredDropPercent * 100).toFixed(1)}% drop (max ${(maxDropThreshold * 100).toFixed(0)}%) - spread too wide`);
         // FIX #7: Emit signalRejected event
         this.emit('signalRejected', {
           reason: 'leg2SpreadTooWide',
@@ -3316,8 +4265,8 @@ export class DipArbService extends EventEmitter {
     // Verify signal meets minimum profit rate requirement
     const minProfitRate = this.config.minProfitRate ?? 0.02;
     if (signal.estimatedProfitRate < minProfitRate) {
-      // Always log profit rejections (critical for understanding why no trades)
-      console.log(`[DipArb] ❌ Signal rejected: ${signal.dipSide} dip ${(signal.dropPercent * 100).toFixed(1)}%, but profit ${(signal.estimatedProfitRate * 100).toFixed(2)}% < min ${(minProfitRate * 100).toFixed(0)}% (cost=${signal.estimatedTotalCost.toFixed(4)})`);
+      // Log with deduplication (critical for understanding why no trades)
+      this.logRejection('low_profit', `${signal.dipSide} dip ${(signal.dropPercent * 100).toFixed(1)}%, but profit ${(signal.estimatedProfitRate * 100).toFixed(2)}% < min ${(minProfitRate * 100).toFixed(0)}% (cost=${signal.estimatedTotalCost.toFixed(4)})`);
       // FIX #7: Emit signalRejected event
       this.emit('signalRejected', {
         reason: 'lowProfitRate',
@@ -3328,6 +4277,38 @@ export class DipArbService extends EventEmitter {
       return false;
     }
 
+    // ========================================
+    // P1.1: Chainlink Momentum Validation
+    // ========================================
+    // Validate dip direction against underlying price movement
+    // Uses Chainlink price history instead of Binance (which may be geofenced)
+    if (this.config.enableChainlinkMomentum) {
+      const momentum = this.checkChainlinkMomentum(signal.dipSide, signal.source);
+
+      if (!momentum.confirmed) {
+        const requireMomentum = this.config.requireChainlinkMomentum ?? false;
+
+        if (requireMomentum) {
+          // Blocking mode - reject signal (log with deduplication)
+          this.logRejection('momentum', momentum.reason);
+          this.emit('signalRejected', {
+            reason: 'chainlinkMomentum',
+            details: momentum.reason,
+            signal,
+            timestamp: Date.now(),
+          });
+          return false;
+        } else {
+          // Advisory mode - log warning but allow signal
+          if (this.config.debug) {
+            this.log(`⚠️ Momentum warning (advisory): ${momentum.reason}`);
+          }
+        }
+      } else if (this.config.debug && momentum.reason !== 'insufficient_history') {
+        this.log(`✅ Momentum confirmed: ${momentum.reason}`);
+      }
+    }
+
     if (this.config.debug) {
       this.log(`✅ Leg1 signal validated: ${signal.dipSide} @ ${signal.currentPrice.toFixed(4)}, drop ${(signal.dropPercent * 100).toFixed(1)}%`);
       this.log(`   Opposite side: depth=${totalOppDepth.toFixed(0)} shares, best=${bestOppositePrice.toFixed(4)}`);
@@ -3336,6 +4317,37 @@ export class DipArbService extends EventEmitter {
     }
 
     return true;
+  }
+
+  // ===== Private: Market Scoring (P1.2) =====
+
+  /**
+   * P1.2: Record a trade result for market scoring
+   * Called when a round completes (either success, timeout, or settlement)
+   */
+  private recordTradeForScoring(result: DipArbRoundResult): void {
+    if (!this.market) return;
+
+    const tradeResult: TradeResult = {
+      underlying: this.market.underlying,
+      duration: this.market.durationMinutes === 5 ? '5m' :
+                this.market.durationMinutes === 15 ? '15m' :
+                this.market.durationMinutes === 60 ? '1h' :
+                this.market.durationMinutes === 240 ? '4h' : 'daily',
+      leg1Filled: !!result.leg1,
+      leg2Filled: result.status === 'completed' && !!result.leg2,
+      netProfit: result.profit,
+      leg2WaitTimeSec: result.leg1 && result.leg2
+        ? (result.leg2.timestamp - result.leg1.timestamp) / 1000
+        : undefined,
+      timestamp: Date.now(),
+    };
+
+    this.marketScorer.recordTrade(tradeResult);
+
+    if (this.config.debug) {
+      this.log(`📊 P1.2: Recorded trade for scoring - ${tradeResult.underlying}/${tradeResult.duration}, completed=${tradeResult.leg2Filled}`);
+    }
   }
 
   // ===== Private: Signal Handling =====
@@ -4468,6 +5480,72 @@ export class DipArbService extends EventEmitter {
     return defaultTimeout; // Use config for longer markets
   }
 
+  /**
+   * P2.3: Check if we should extend timeout for high-probability settlement
+   *
+   * When near timeout, instead of forcing a degraded Leg2 or emergency exit,
+   * check if conditions favor holding to settlement:
+   * - Settlement is soon (< settlementExtensionMaxMinutes, default 5min)
+   * - Win probability is high (> settlementExtensionWinProbThreshold, default 70%)
+   *
+   * If both conditions are met, extend timeout to let position settle naturally.
+   *
+   * @returns Object with extend boolean, reason, and details
+   */
+  private shouldExtendTimeoutForSettlement(): {
+    extend: boolean;
+    reason: string;
+    winProbability: number;
+    timeToSettlementMin: number;
+  } {
+    const noExtend = { extend: false, reason: '', winProbability: 0, timeToSettlementMin: 0 };
+
+    // Check if P2.3 feature is enabled
+    if (!this.config.enableSettlementHoldExtension) {
+      return { ...noExtend, reason: 'disabled' };
+    }
+
+    // Check if we have a valid position
+    if (!this.market || !this.currentRound?.leg1) {
+      return { ...noExtend, reason: 'no_position' };
+    }
+
+    // Calculate time to settlement
+    const now = Date.now();
+    const endTime = this.market.endTime instanceof Date
+      ? this.market.endTime.getTime()
+      : (typeof this.market.endTime === 'number' ? this.market.endTime : new Date(this.market.endTime).getTime());
+    const timeToSettlementMin = (endTime - now) / 60000;
+
+    // Market must be ending soon (< settlementExtensionMaxMinutes)
+    const maxMinutesForExtension = this.config.settlementExtensionMaxMinutes ?? 5;
+    if (timeToSettlementMin > maxMinutesForExtension || timeToSettlementMin <= 0) {
+      return { ...noExtend, reason: 'settlement_too_far', timeToSettlementMin };
+    }
+
+    // Check win probability
+    const winProbability = this.getPositionWinProbability(this.currentRound.leg1.side);
+    const probThreshold = this.config.settlementExtensionWinProbThreshold ?? 0.70;
+
+    if (winProbability < probThreshold) {
+      return { extend: false, reason: 'probability_too_low', winProbability, timeToSettlementMin };
+    }
+
+    // Both conditions met - recommend extension
+    if (this.config.debug) {
+      this.log(`🎯 P2.3: High-probability settlement extension triggered`);
+      this.log(`   Win probability: ${(winProbability * 100).toFixed(1)}% (threshold: ${(probThreshold * 100).toFixed(0)}%)`);
+      this.log(`   Time to settlement: ${timeToSettlementMin.toFixed(1)} min (threshold: ${maxMinutesForExtension} min)`);
+    }
+
+    return {
+      extend: true,
+      reason: 'high_probability_settlement',
+      winProbability,
+      timeToSettlementMin,
+    };
+  }
+
   // ===== Private: Settlement Awareness Methods =====
 
   /**
@@ -5096,6 +6174,49 @@ export class DipArbService extends EventEmitter {
     const upChange = ((last.upAsk - first.upAsk) / first.upAsk * 100).toFixed(2);
     const downChange = ((last.downAsk - first.downAsk) / first.downAsk * 100).toFixed(2);
     this.log(`   Change: UP ${upChange}% | DOWN ${downChange}%`);
+  }
+
+  /**
+   * Log signal rejection with deduplication
+   * - Logs immediately on NEW rejection type
+   * - Batches repeated rejections into periodic summaries
+   * NOTE: Bypasses debug filter - these are critical logs for understanding why no trades occur
+   */
+  private logRejection(reason: string, details: string): void {
+    const now = Date.now();
+    const count = (this.rejectionCounts.get(reason) ?? 0) + 1;
+    this.rejectionCounts.set(reason, count);
+
+    // Helper to output directly (bypasses debug filter - critical logs)
+    const output = (msg: string) => {
+      const formatted = `[DipArb] ${msg}`;
+      if (this.config.logHandler) {
+        this.config.logHandler(formatted);
+      } else {
+        console.log(formatted);
+      }
+    };
+
+    // Log immediately if this is a new rejection type
+    if (this.lastRejectionType !== reason) {
+      output(`❌ Signal rejected: ${details}`);
+      this.lastRejectionType = reason;
+      this.lastRejectionLogTime = now;
+      return;
+    }
+
+    // Log periodic summary
+    if (now - this.lastRejectionLogTime >= this.REJECTION_LOG_INTERVAL_MS) {
+      const summary = Array.from(this.rejectionCounts.entries())
+        .filter(([_, c]) => c > 1)
+        .map(([r, c]) => `${r}×${c}`)
+        .join(', ');
+      if (summary) {
+        output(`📊 Rejection summary (30s): ${summary}`);
+      }
+      this.rejectionCounts.clear();
+      this.lastRejectionLogTime = now;
+    }
   }
 
   private log(message: string): void {

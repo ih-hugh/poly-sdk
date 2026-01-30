@@ -248,7 +248,13 @@ export type {
   DURATION_PRIORITY,
   DURATION_FALLBACK_CHAIN,
   COIN_TO_FULL_NAME,
+  // P1.1: Chainlink momentum types
+  ChainlinkMomentumResult,
 } from './services/dip-arb-types.js';
+
+// P1.2: Market Scorer - Performance tracking for market selection
+export { MarketScorer } from './services/market-scorer.js';
+export type { MarketScore, TradeResult } from './services/market-scorer.js';
 
 // DipArbManager - Multi-Market Orchestrator for parallel trading
 export { DipArbManager } from './services/dip-arb-manager.js';
