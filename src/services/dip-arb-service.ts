@@ -1685,6 +1685,56 @@ export class DipArbService extends EventEmitter {
       };
     }
 
+    // ===== Leg1 Maker Order Attempt (0% fee vs 3% taker) =====
+    if (!this.config.paperMode && this.config.enableMakerOrdersLeg1) {
+      const makerResult = await this.attemptMakerOrderLeg1(signal, startTime);
+      if (makerResult && makerResult.success) {
+        // Record the maker fill as leg1
+        this.currentRound.leg1 = {
+          side: signal.dipSide,
+          price: makerResult.price!,
+          shares: makerResult.shares!,
+          timestamp: Date.now(),
+          tokenId: signal.tokenId,
+          makerFill: true,
+        };
+        this.currentRound.phase = 'leg1_filled';
+        this.stats.leg1Filled++;
+        this.openPositionCount++;
+
+        this.lastExecutionTime = Date.now();
+        this.log(`Leg1 FILLED (MAKER): ${signal.dipSide} x${makerResult.shares!.toFixed(1)} @ ${makerResult.price!.toFixed(4)} (Open: ${this.openPositionCount}) [0% fee]`);
+
+        // Emit execution event
+        this.emit('execution', {
+          ...makerResult,
+          roundId: this.currentRound.roundId,
+          makerFill: true,
+        });
+
+        return makerResult;
+      }
+
+      // Maker failed — check if fallback is enabled
+      if (!this.config.leg1MakerFallbackToTaker) {
+        this.isExecuting = false;
+        if (this.config.debug) {
+          this.log(`Leg1 maker failed and fallback disabled — abandoning signal`);
+        }
+        return {
+          success: false,
+          leg: 'leg1',
+          roundId: signal.roundId,
+          error: 'Leg1 maker order failed and fallback disabled',
+          executionTimeMs: Date.now() - startTime,
+        };
+      }
+      // Fall through to existing market order logic
+      if (this.config.debug) {
+        this.log(`Leg1 maker failed — falling back to market order`);
+      }
+    }
+
     // ===== Paper Trading Mode =====
     // Simulate order fills without sending real orders
     if (this.config.paperMode) {
@@ -2044,10 +2094,13 @@ export class DipArbService extends EventEmitter {
         this.currentRound.phase = 'completed';
         this.currentRound.totalCost = actualTotalCost;
 
-        // ✅ FIX: Calculate NET profit after fees (same as paper mode)
+        // ✅ FIX: Calculate NET profit after fees (fee-aware per leg)
         const feeRate = this.config.takerFeeRate ?? DIP_ARB_CRYPTO_TAKER_FEE;
         const grossProfit = 1 - actualTotalCost;
-        const totalFees = actualTotalCost * feeRate * 2;
+        const leg1WasMaker = this.currentRound.leg1?.makerFill === true;
+        const leg1Fee = leg1WasMaker ? 0 : (leg1Price * feeRate);
+        const leg2Fee = avgPrice * feeRate; // Leg2 is taker in this path
+        const totalFees = leg1Fee + leg2Fee;
         const netProfitPerShare = grossProfit - totalFees;
         const netProfit = netProfitPerShare * totalSharesFilled;
 
@@ -2274,11 +2327,12 @@ export class DipArbService extends EventEmitter {
         this.currentRound.phase = 'completed';
         this.currentRound.totalCost = actualTotalCost;
 
-        // Maker = 0% fee for Leg2, only 3% for Leg1
+        // Fee-aware: check if Leg1 was also maker (0% both legs possible)
         const feeRate = this.config.takerFeeRate ?? DIP_ARB_CRYPTO_TAKER_FEE;
         const grossProfit = 1 - actualTotalCost;
-        const leg1Fee = leg1Price * feeRate;
-        const leg2Fee = 0; // Maker order = 0% fee
+        const leg1WasMaker = this.currentRound.leg1?.makerFill === true;
+        const leg1Fee = leg1WasMaker ? 0 : (leg1Price * feeRate);
+        const leg2Fee = 0; // Maker Leg2
         const totalFees = leg1Fee + leg2Fee;
         const netProfitPerShare = grossProfit - totalFees / filledShares;
         const netProfit = netProfitPerShare * filledShares;
@@ -2328,6 +2382,124 @@ export class DipArbService extends EventEmitter {
       this.log(`📊 P2.2: Maker order error: ${error instanceof Error ? error.message : String(error)}`);
       return null;
     }
+  }
+
+  /**
+   * Attempt to fill Leg1 as a maker (limit) order for 0% fees.
+   * Short timeout since dip opportunities are fleeting.
+   * Returns execution result if filled, null if not filled (caller should fallback).
+   */
+  private async attemptMakerOrderLeg1(
+    signal: DipArbLeg1Signal,
+    startTime: number,
+  ): Promise<DipArbExecutionResult | null> {
+    if (!this.tradingService || !this.currentRound) return null;
+
+    const makerTimeout = this.config.leg1MakerTimeout ?? 3;
+    const priceImprovement = this.config.leg1MakerPriceImprovement ?? 0.001;
+
+    // Place limit order at signal price with small improvement
+    // For BUY orders, price improvement means bidding slightly higher (more aggressive)
+    const limitPrice = signal.targetPrice * (1 + priceImprovement);
+
+    // Ensure minimum order size
+    const minSharesForMinAmount = Math.ceil(1 / limitPrice);
+    const adjustedShares = Math.max(signal.shares, minSharesForMinAmount);
+
+    if (this.config.debug) {
+      this.log(`Leg1 maker: placing GTC limit BUY at $${limitPrice.toFixed(4)} (signal: $${signal.targetPrice.toFixed(4)}, improvement: ${(priceImprovement * 100).toFixed(2)}%)`);
+    }
+
+    let orderId: string;
+    try {
+      const orderResult = await this.tradingService.createLimitOrder({
+        tokenId: signal.tokenId,
+        side: 'BUY' as Side,
+        price: limitPrice,
+        size: adjustedShares,
+        orderType: 'GTC',
+      });
+      if (!orderResult.success || !orderResult.orderId) {
+        if (this.config.debug) this.log(`Leg1 maker: order placement failed: ${orderResult.errorMsg}`);
+        return null;
+      }
+      orderId = orderResult.orderId;
+    } catch (err) {
+      if (this.config.debug) this.log(`Leg1 maker: order placement error: ${err}`);
+      return null;
+    }
+
+    if (this.config.debug) {
+      this.log(`Leg1 maker: order placed: ${orderId}, polling for fill...`);
+    }
+
+    // Poll for fill with short timeout (faster than Leg2's 2s)
+    const pollIntervalMs = 500;
+    const maxPolls = Math.floor((makerTimeout * 1000) / pollIntervalMs);
+
+    for (let i = 0; i < maxPolls; i++) {
+      await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+
+      try {
+        const openOrders = await this.tradingService.getOpenOrders();
+        const order = openOrders.find(o => o.id === orderId);
+
+        if (!order) {
+          // Order no longer open — check if it was filled
+          const trades = await this.tradingService.getTrades();
+          const fill = trades.find(t => t.tokenId === signal.tokenId);
+
+          if (fill) {
+            const fillPrice = fill.price || limitPrice;
+            const fillShares = fill.size || adjustedShares;
+
+            this.log(`Leg1 maker FILLED: ${fillShares} shares at $${fillPrice.toFixed(4)} (0% fee)`);
+
+            return {
+              success: true,
+              leg: 'leg1',
+              roundId: signal.roundId,
+              side: signal.dipSide,
+              price: fillPrice,
+              shares: fillShares,
+              orderId,
+              executionTimeMs: Date.now() - startTime,
+            };
+          }
+          // Order disappeared but no fill found
+          if (this.config.debug) this.log(`Leg1 maker: order gone but no fill found`);
+          return null;
+        }
+
+        // Check for partial fills — if essentially complete, accept it
+        if (order.filledSize > 0 && order.remainingSize < 1) {
+          this.log(`Leg1 maker FILLED (partial complete): ${order.filledSize} shares (0% fee)`);
+          return {
+            success: true,
+            leg: 'leg1',
+            roundId: signal.roundId,
+            side: signal.dipSide,
+            price: order.price,
+            shares: order.filledSize,
+            orderId,
+            executionTimeMs: Date.now() - startTime,
+          };
+        }
+      } catch (err) {
+        if (this.config.debug) this.log(`Leg1 maker: poll error: ${err}`);
+      }
+    }
+
+    // Timeout — cancel and return null for fallback
+    if (this.config.debug) {
+      this.log(`Leg1 maker: not filled in ${makerTimeout}s, cancelling`);
+    }
+    try {
+      await this.tradingService.cancelOrder(orderId);
+    } catch (err) {
+      if (this.config.debug) this.log(`Leg1 maker: cancel error: ${err}`);
+    }
+    return null;
   }
 
   /**
