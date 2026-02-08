@@ -477,6 +477,39 @@ export interface DipArbServiceConfig {
    */
   makerOrderTimeout?: number;
 
+  // ============= Leg1 Maker Orders (Fee Elimination) =============
+
+  /**
+   * Enable maker (limit) orders for Leg1 entry.
+   * Places a GTC limit order at signal price instead of a taker market order.
+   * If not filled within timeout, falls back to market order (if fallback enabled).
+   * Maker fee = 0% vs taker fee = 3%.
+   * @default true
+   */
+  enableMakerOrdersLeg1?: boolean;
+
+  /**
+   * Maximum seconds to wait for Leg1 maker order fill before fallback.
+   * Must be short since dip opportunities are fleeting.
+   * @default 3
+   */
+  leg1MakerTimeout?: number;
+
+  /**
+   * Price improvement for Leg1 maker order (fraction of current price).
+   * Positive = more aggressive (closer to ask), negative = more passive (lower bid).
+   * Set to 0 to place at exact signal price.
+   * @default 0.001 (0.1% price improvement)
+   */
+  leg1MakerPriceImprovement?: number;
+
+  /**
+   * Whether to fall back to a taker market order if Leg1 maker order doesn't fill.
+   * If false and maker doesn't fill, the signal is abandoned.
+   * @default true
+   */
+  leg1MakerFallbackToTaker?: boolean;
+
   // ============= P2.3: High-Probability Timeout Extension Configuration =============
 
   /**
@@ -589,11 +622,16 @@ export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
   orderFlowDepthLevels: 3,              // Sum top 3 levels for pressure calculation
   spreadWideningWindowMs: 500,          // 500ms window for spread widening detection
   largeCancellationThreshold: 500,      // $500 minimum for significant cancellation
-  // P2.2: Dynamic fee optimization (maker orders)
+  // P2.2: Dynamic fee optimization (maker orders for Leg2)
   enableMakerOrders: false,             // Disabled by default - requires more testing
   minTimeForMakerOrder: 60,             // Need 60s+ remaining to attempt maker
   makerPriceImprovement: 0.001,         // 0.1% inside spread
   makerOrderTimeout: 30,                // 30s wait before converting to market
+  // Leg1 maker orders (fee elimination)
+  enableMakerOrdersLeg1: true,          // ✅ ENABLED: 0% fee vs 3% taker
+  leg1MakerTimeout: 3,                  // 3s timeout (dips are fleeting)
+  leg1MakerPriceImprovement: 0.001,     // 0.1% price improvement
+  leg1MakerFallbackToTaker: true,       // Fall back to market order if maker fails
   // P2.3: High-probability timeout extension
   enableSettlementHoldExtension: false, // Disabled by default
   settlementExtensionWinProbThreshold: 0.70, // 70% win prob threshold
@@ -707,6 +745,8 @@ export interface DipArbLegInfo {
   timestamp: number;
   /** Token ID */
   tokenId: string;
+  /** true if this leg was filled as a maker order (0% fee) */
+  makerFill?: boolean;
 }
 
 /**

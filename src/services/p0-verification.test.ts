@@ -212,6 +212,22 @@ describe('P2 Verification', () => {
     });
   });
 
+  describe('Leg1 Maker Orders (Fee Elimination) Config', () => {
+    it('should have Leg1 maker order config values defined', () => {
+      expect(DEFAULT_DIP_ARB_CONFIG.enableMakerOrdersLeg1).toBeDefined();
+      expect(DEFAULT_DIP_ARB_CONFIG.leg1MakerTimeout).toBeDefined();
+      expect(DEFAULT_DIP_ARB_CONFIG.leg1MakerPriceImprovement).toBeDefined();
+      expect(DEFAULT_DIP_ARB_CONFIG.leg1MakerFallbackToTaker).toBeDefined();
+    });
+
+    it('should have Leg1 maker order config with correct defaults', () => {
+      expect(DEFAULT_DIP_ARB_CONFIG.enableMakerOrdersLeg1).toBe(true);
+      expect(DEFAULT_DIP_ARB_CONFIG.leg1MakerTimeout).toBe(3);
+      expect(DEFAULT_DIP_ARB_CONFIG.leg1MakerPriceImprovement).toBe(0.001);
+      expect(DEFAULT_DIP_ARB_CONFIG.leg1MakerFallbackToTaker).toBe(true);
+    });
+  });
+
   describe('P2.3: High-Probability Timeout Extension Config', () => {
     it('should have P2.3 config values defined', () => {
       expect(DEFAULT_DIP_ARB_CONFIG.enableSettlementHoldExtension).toBeDefined();
